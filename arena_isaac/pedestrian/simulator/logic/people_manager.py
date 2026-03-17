@@ -93,6 +93,7 @@ class PeopleManager:
         with self._lock:
             for person in list(self._people.values()):
                 person.destroy()
+            self._people.clear()
 
     @classmethod
     def rebuild_nav_mesh(cls, height=1.5, radius=35.0, auto_rebake_on_changes=False, auto_rebake_delay_seconds=4, exclude_rigid_bodies=False, view_nav_mesh=False, dynamic_avoidance_enabled=True, navmesh_enabled=True):
