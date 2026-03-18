@@ -128,13 +128,10 @@ class Person:
         """
         if self._character_graph is None:
             self.add_animation_graph_to_agent()
-            # Re-spawn during reset and leave the character registration one frame behind.
-            # Retry across a couple of app updates before giving up for this tick.
-            for _ in range(3):
-                self._character_graph = ag.get_character(self.character_skel_root_stage_path)
-                if self._character_graph:
-                    break
-                self._flush_app()
+            # Attempt to retrieve the character graph once; if it is not yet available,
+            # it will be retried on subsequent accesses/ticks without forcing app updates
+            # from within potential physics callbacks.
+            self._character_graph = ag.get_character(self.character_skel_root_stage_path)
         return self._character_graph
 
     @property
