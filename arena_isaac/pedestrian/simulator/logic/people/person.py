@@ -5,6 +5,7 @@ from collections import deque
 import carb
 import numpy as np
 import omni.anim.graph.core as ag
+import omni.kit.app
 
 # High level Isaac sim APIs
 import omni.client
@@ -127,6 +128,9 @@ class Person:
         """
         if self._character_graph is None:
             self.add_animation_graph_to_agent()
+            # Attempt to retrieve the character graph once; if it is not yet available,
+            # it will be retried on subsequent accesses/ticks without forcing app updates
+            # from within potential physics callbacks.
             self._character_graph = ag.get_character(self.character_skel_root_stage_path)
         return self._character_graph
 
@@ -260,6 +264,7 @@ class Person:
 
         # Spawn the person in the world
         self.prim = prims.create_prim(stage_name, "Xform", usd_path=usd_file)
+        self._flush_app()
 
         # Set the initial position and orientation of the person
         self.prim.GetAttribute("xformOp:translate").Set(Gf.Vec3d(float(init_pos[0]), float(init_pos[1]), float(init_pos[2])))
@@ -290,6 +295,14 @@ class Person:
         # Add the animation graph to the character
         if self.character_skel_root is not None:
             omni.kit.commands.execute("ApplyAnimationGraphAPICommand", paths=[Sdf.Path(self.character_skel_root.GetPrimPath())], animation_graph_path=Sdf.Path(animation_graph.GetPrimPath()))
+            self._flush_app()
+
+    @staticmethod
+    def _flush_app():
+        try:
+            omni.kit.app.get_app().update()
+        except Exception:
+            pass
 
     @staticmethod
     def _transverse_prim(stage, stage_prefix):
