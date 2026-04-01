@@ -1,0 +1,6 @@
+string name
+string usd_path
+string robot_namespace
+geometry_msgs/Pose pose
+---
+string path

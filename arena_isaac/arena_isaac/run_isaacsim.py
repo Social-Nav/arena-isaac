@@ -2,20 +2,16 @@
 
 
 # preload attrs
-import argparse
 import os
 import arena_simulation_setup
 import arena_simulation_setup.utils.cattrs
-import signal
-import sys
 
 # Use the isaacsim to import SimulationApp
 from isaacsim import SimulationApp
 
 # Setting the config for simulation and make an simulation.
 CONFIG = {
-    # "renderer": "Wireframe",
-    "renderer": "RayTracedLighting",
+    "renderer": "Wireframe",
     "headless": False,
 }
 #import parent directory
@@ -27,6 +23,7 @@ parent_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(parent_dir))
 
 # stdlib
+import queue
 import random
 import traceback
 
@@ -82,6 +79,10 @@ def enable_extensions_from_kit(kit_path):
         dependencies = data.get("dependencies", {})
 
         for ext_name in dependencies.keys():
+            # Skip filter selectors in .kit files (e.g. "filter:platform"),
+            # they are not real extension names and cannot be enabled directly.
+            if isinstance(ext_name, str) and ext_name.startswith("filter:"):
+                continue
             print(f"Enabling: {ext_name}")
             enable_extension(ext_name)
 
@@ -101,8 +102,6 @@ omni.usd.get_context().new_stage()
 extensions.enable_extension("isaacsim.ros2.bridge")
 extensions.enable_extension("isaacsim.sensors.physics")
 extensions.enable_extension("isaacsim.sensors.camera")
-
-import random
 
 import numpy as np
 
@@ -129,10 +128,6 @@ from arena_isaac.services import services
 from pedestrian.simulator.logic.people_manager import PeopleManager
 from rclpy.qos import QoSProfile
 from arena_isaac import run_after_tick_queue
-import traceback
-from omni.isaac.core.utils.prims import is_prim_path_valid
-from vln_dataset_logger_replicator import VLNDataLoggerReplicator
-from vln_dataset_logger_rosbag import VLNDataLoggerRosbag
 
 # fmt: on
 # ======================================Base======================================
@@ -271,28 +266,12 @@ class IsaacController(rclpy.node.Node):
 
 # ======================================main=======================================
 
-keep_running = True
 
 def main(args=None):
     """
     Main function to initialize the simulation, create the ROS 2 node,
     and run the simulation loop.
     """
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--save-data', type=str, default='false', 
-                       help='Enable VLN dataset logging')
-    parser.add_argument('--log-level', type=str, default='info',
-                       help='log level for IsaacSim (debug/info/warn/error)')
-    parsed_args = parser.parse_args(args)
-    
-    enable_logging = parsed_args.save_data.lower() == 'true'
-    # apply log level if requested
-    try:
-        ll = parsed_args.log_level.lower()
-        # carb logging thresholds are uppercase
-        log.set_level_threshold(getattr(carb.logging, f"LEVEL_{ll.upper()}"))
-    except Exception:
-        pass
 
     sim = SimulationContext()
 
@@ -308,56 +287,13 @@ def main(args=None):
     PublishTime('/World/publish_time')
     world.reset()
 
-    frame_step_counter = 0  # counter initialization
-    logger = None
-    target_camera_path = "/World/Robots/jackal/camera_link/front_camera"
-    target_pedestrian_root_path = "/World/Pedestrians"
-    target_lidar_path = "/World/Robots/jackal/lidar_link/gpu_lidar"
-    
-    has_saved = False
-    global keep_running
-    # Replicator
-    def emergency_save_handler(signum, frame):        
-        nonlocal has_saved
-        sys.stderr.write(f"\n[SIGNAL] Received termination signal ({signum}). Saving data...\n")
-        sys.stderr.flush()
-        
-        if not has_saved and logger and len(logger.param_buffer) > 0:
-            try:
-                logger.save_episode()
-                has_saved = True
-                sys.stderr.write("[SUCCESS] Data saved successfully!\n")
-            except Exception as e:
-                sys.stderr.write(f"[ERROR] Save failed: {e}\n")
-        else:
-            sys.stderr.write("[INFO] Buffer is empty or already saved.\n")
-        
-        sys.stderr.flush()
-        sys.exit(0)
-        
-    signal.signal(signal.SIGINT, emergency_save_handler)
-    signal.signal(signal.SIGTERM, emergency_save_handler)
-    
-    # ROSBAG
-    # rosbag_process = None
-    # def forward_signal_to_rosbag(signum, frame):
-    #     global keep_running, rosbag_process
-    #     sys.stderr.write(f"\n[Signal] Received signal ({signum}); requesting safe stop...\n")
-    #     if rosbag_process:
-    #         sys.stderr.write(f"[Signal] Forwarding SIGINT to rosbag (PID {rosbag_process.pid})...\n")
-    #         rosbag_process.send_signal(signal.SIGINT)
-    #     keep_running = False
-    
-    # signal.signal(signal.SIGINT, forward_signal_to_rosbag)
-    # signal.signal(signal.SIGTERM, forward_signal_to_rosbag)
-    
-    sys.stderr.write("[System] Signal interception enabled, ready to save data.\n")
     # set photoreal settings
     import isaac_utils.config.photoreal as photoreal
     if os.environ.get('RENDER_PRESET', 'photoreal') != 'boring':
         photoreal.PRESET_PHOTOREAL.apply()
     else:
         photoreal.PRESET_DEFAULT.apply()
+
     # hard reset once
     omni.timeline.get_timeline_interface().stop()
 
@@ -375,47 +311,6 @@ def main(args=None):
                 elevator_manager.update()
                 world.step(render=True)
                 stepped_this_iteration = True
-                # Start data collection and saving
-                if enable_logging:
-                    # Check every 50 frames whether the robot appears
-                    if logger is None and frame_step_counter % 50 == 0:
-                        
-                        if is_prim_path_valid(target_camera_path):
-                            try:
-                                logger = VLNDataLoggerReplicator(camera_prim_path=target_camera_path, pedestrian_root_path = target_pedestrian_root_path, lidar_prim_path=target_lidar_path) # replicator logic
-                                '''
-                                logger = VLNDataLoggerRosbag(
-                                    topics=[
-                                        "/task_generator_node/jackal/odom",
-                                        "/task_generator_node/jackal/front_camera/camera_info",
-                                        "/task_generator_node/jackal/front_camera/image",
-                                        "/task_generator_node/jackal/front_camera/depth",
-                                        "/task_generator_node/jackal/lidar/points",
-                                        "/task_generator_node/human_states",
-                                        "/tf",
-                                        "/tf_static",
-                                    ],
-                                    output_dir="collected_data"
-                                    )
-                                logger.start_recording()  # start rosbag recording
-                                rosbag_process = logger.process  # rosbag logic
-                                controller.get_logger().info('✅ VLNDataLoggerRosbag initialized successfully')
-                                '''
-                            except Exception as e:
-                                sys.stderr.write(f"\n VLNDataLogger initialization failed: {e}\n")
-                        else:
-                            if frame_step_counter % 300 == 0: 
-                                sys.stderr.write(f" Waiting for robot spawn... searching path: {target_camera_path}")
-                    if logger:
-                        try:
-                            logger.step(step_idx=frame_step_counter) # replicator logic
-                            frame_step_counter += 1  # increment after each capture
-                            
-                        except Exception as e:
-                            # Force stack trace to stderr
-                            sys.stderr.write(f"\n🔥 Logger step crashed: {e}\n")
-                            traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)
-                            sys.stderr.flush()
             else:
                 if was_playing:
                     world.pause()
@@ -442,22 +337,11 @@ def main(args=None):
         controller.get_logger().error(traceback.format_exc())
         traceback.print_exc(file=sys.stdout)
     finally:
-        if enable_logging:
-            if logger and not has_saved:
-                sys.stderr.write(f"[SAVE] Writing {len(logger.param_buffer)} frames to disk...\n")
-                logger.save_episode() # for replicator
-                # logger.stop_recording()  # for rosbag
-                has_saved = True
-                sys.stderr.write("[SAVE] Save complete!\n")
-            else:
-                pass
-        sys.stderr.write("[Finally] Shutting down ROS 2 node and simulation....\n")
-        if controller is not None:
-            controller.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
-    
+        controller.get_logger().info('Shutting down ROS 2 node and simulation.')
+        controller.destroy_node()
+        rclpy.shutdown()
         simulation_app.close()
+
 
 # =================================================================================
 if __name__ == "__main__":
