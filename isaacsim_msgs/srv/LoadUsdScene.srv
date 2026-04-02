@@ -1,0 +1,19 @@
+# Service to load a complete USD scene (e.g., GRScenes)
+# This is different from SpawnUsd which adds a USD reference as a child prim
+
+# Request
+string usd_path                 # Absolute path to USD file
+string scene_prim_path          # Target prim path (default: /World/Scene)
+float32 scale                   # Scale factor (default: 1.0)
+float32[3] position             # Position [x, y, z]
+float32[4] orientation          # Quaternion [x, y, z, w]
+bool add_colliders              # Whether to add physics colliders
+bool disable_collision_cooking  # Disable cooking for faster loading
+
+---
+
+# Response
+bool success                    # Whether loading succeeded
+string message                  # Status message
+string scene_prim_path          # Actual prim path where scene was loaded
+

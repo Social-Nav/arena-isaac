@@ -4,6 +4,7 @@ from .DeletePedestrians import delete_pedestrians_service
 from .DeletePrims import delete_prims_service
 from .EditPrims import edit_prims_service
 from .GetPrims import get_prims_service
+from .LoadUsdScene import load_usd_scene_service
 from .NavigatePedestrians import navigate_pedestrians_service
 from .SpawnDoors import spawn_doors_service
 from .SpawnElevators import spawn_elevators_service
@@ -20,6 +21,7 @@ services: collections.abc.Iterable[Service] = (
     delete_prims_service,
     edit_prims_service,
     get_prims_service,
+    load_usd_scene_service,
     navigate_pedestrians_service,
     spawn_doors_service,
     spawn_elevators_service,
