@@ -260,7 +260,8 @@ class Person:
 
         # Spawn the person in the world
         self.prim = prims.create_prim(stage_name, "Xform", usd_path=usd_file)
-
+        self._flush_app()
+        
         # Set the initial position and orientation of the person
         self.prim.GetAttribute("xformOp:translate").Set(Gf.Vec3d(float(init_pos[0]), float(init_pos[1]), float(init_pos[2])))
 
@@ -290,6 +291,14 @@ class Person:
         # Add the animation graph to the character
         if self.character_skel_root is not None:
             omni.kit.commands.execute("ApplyAnimationGraphAPICommand", paths=[Sdf.Path(self.character_skel_root.GetPrimPath())], animation_graph_path=Sdf.Path(animation_graph.GetPrimPath()))
+            self._flush_app()
+
+    @staticmethod
+    def _flush_app():
+        try:
+            omni.kit.app.get_app().update()
+        except Exception:
+            pass
 
     @staticmethod
     def _transverse_prim(stage, stage_prefix):
@@ -370,19 +379,30 @@ class Person:
         Method that will delete the person from the simulation world.
         """
 
-        # Remove the physics callback
-        self._world.remove_physics_callback(self._stage_prefix + "/state")
-        self._world.remove_physics_callback(self._stage_prefix + "/update")
+        # Remove the physics callbacks (guard against already-removed callbacks)
+        for cb in (self._stage_prefix + "/state", self._stage_prefix + "/update"):
+            try:
+                if self._world.physics_callback_exists(cb):
+                    self._world.remove_physics_callback(cb)
+            except Exception as e:
+                carb.log_warn(f"Exception while removing physics callback '{cb}': {e}")
 
         # Remove the timeline callback
-        self._world.remove_timeline_callback(self._stage_prefix + "/start_stop_sim")
+        try:
+            if self._world.timeline_callback_exists(self._stage_prefix + "/start_stop_sim"):
+                self._world.remove_timeline_callback(self._stage_prefix + "/start_stop_sim")
+        except Exception as e:
+            carb.log_warn(f"Exception while removing timeline callback: {e}")
 
         # Delete the prim from the stage
-        prims.delete_prim(self._stage_prefix)
+        try:
+            prims.delete_prim(self._stage_prefix)
+        except Exception as e:
+            carb.log_warn(f"Exception while deleting prim '{self._stage_prefix}': {e}")
+        # NOTE: do NOT call PeopleManager.remove_person() here;
+        # remove_person() already called destroy() to get here, calling back
+        # would be an infinite recursion and uses the wrong key anyway.
 
-        # Remove the person from the people manager
-        if (path := self.character_skel_root_stage_path) is not None:
-            PeopleManager.get_people_manager().remove_person(path)
 
     @property
     def position(self) -> np.ndarray:

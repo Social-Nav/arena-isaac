@@ -18,7 +18,11 @@ _robot_articulation_registry: dict[str, str] = {}
 _robot_articulation_registry_lock = threading.RLock()
 
 
-def _normalize_prim_path(prim_path: str) -> str:
+def _normalize_prim_path(prim_path: str | typing.Sequence[str]) -> str:
+    while isinstance(prim_path, (list, tuple)):
+        if not prim_path:
+            return '/'
+        prim_path = prim_path[0]
     return prim_path.rstrip('/') or '/'
 
 

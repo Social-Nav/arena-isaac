@@ -8,10 +8,22 @@ from isaacsim_msgs.srv import DeletePrims
 from .utils import Service, on_exception
 
 
+def _coerce_resolved_path(value) -> str | None:
+    """Normalize Isaac path resolution results to a single prim path string."""
+    while isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        value = value[0]
+    if value is None:
+        return None
+    return str(value)
+
+
 @on_exception(False)
 def delete_prim(name: str) -> bool:
     target = world_path(name)
-    if not (target := Prim.resolve_paths([target])[0]):
+    target = _coerce_resolved_path(Prim.resolve_paths([target]))
+    if not target:
         return True
     geom.unregister_robot(target)
     commands.execute(
