@@ -2,7 +2,10 @@ import math
 
 import numpy as np
 import omni
+import omni.usd
 from isaacsim.core.utils.rotations import euler_angles_to_quat
+from pxr import UsdPhysics
+
 
 from isaac_utils.utils.geom import Rotation, Scale, Translation
 from isaac_utils.utils.material import Material
@@ -37,6 +40,13 @@ def wall_spawner(wall: Wall) -> bool:
         scale=Scale(length, thickness, end[2] - start[2]),
         rotation=Rotation.parse([0, 0, angle]),
     )
+
+    # Add PhysX CollisionAPI so raycast_closest() can detect this wall.
+    stage = omni.usd.get_context().get_stage()
+    wall_prim = stage.GetPrimAtPath(prim_path)
+    if wall_prim.IsValid() and not wall_prim.HasAPI(UsdPhysics.CollisionAPI):
+        collision_api = UsdPhysics.CollisionAPI.Apply(wall_prim)
+        collision_api.CreateCollisionEnabledAttr(True)
 
     if (material := Material.from_msg(wall.material)):
         material.bind_to(prim_path)
