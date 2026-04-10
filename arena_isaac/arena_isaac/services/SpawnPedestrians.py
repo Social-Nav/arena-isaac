@@ -3,6 +3,7 @@ import os
 
 from omni.isaac.core import World
 from pedestrian.simulator.logic.people.person import Person
+from pedestrian.simulator.logic.people_manager import PeopleManager
 
 from isaac_utils.utils.path import world_path
 from isaac_utils.utils.prim import ensure_path
@@ -28,6 +29,10 @@ def spawn_pedestrian(pedestrian: Pedestrian) -> bool:
 
     usd_path = world_path(pedestrian.name)
     ensure_path(os.path.dirname(usd_path))
+
+    # Destroying the old Person first cleanly removes its callbacks and USD prim.
+    PeopleManager.get_people_manager().remove_person(usd_path)  # no-op on first spawn
+
     if not pedestrian.controller_stats:
         Person(world, usd_path, pedestrian.character_name, position, orientation)
     else:

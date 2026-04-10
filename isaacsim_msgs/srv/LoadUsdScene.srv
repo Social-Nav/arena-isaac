@@ -16,4 +16,3 @@ bool disable_collision_cooking  # Disable cooking for faster loading
 bool success                    # Whether loading succeeded
 string message                  # Status message
 string scene_prim_path          # Actual prim path where scene was loaded
-

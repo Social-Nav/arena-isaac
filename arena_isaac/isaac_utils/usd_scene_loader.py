@@ -15,8 +15,12 @@ Usage:
 import carb
 from pathlib import Path
 from pxr import Usd, UsdGeom, UsdPhysics, Gf, Sdf
-from isaacsim.core.utils import prims
 import omni.usd
+
+try:
+    from isaacsim.core.utils import prims
+except ImportError:
+    from omni.isaac.core.utils import prims
 
 
 class USDSceneLoader:
@@ -127,19 +131,19 @@ class USDSceneLoader:
             return False
 
     def _disable_collision_cooking(self):
-        """Disable collision cooking for faster loading."""
+        """Disable UJITSO collision cooking for faster loading."""
         try:
+            import carb
+            import carb.settings
             import omni.physx.bindings._physx as physx_bindings
-            from isaacsim.core.api import SimulationContext
-            
-            simulation_context = SimulationContext.instance()
-            if simulation_context:
-                simulation_context.set_setting(
-                    physx_bindings.SETTING_UJITSO_COLLISION_COOKING, False
-                )
-                carb.log_info("[USDSceneLoader] Disabled collision cooking for faster loading")
+
+            settings = carb.settings.get_settings()
+            settings.set_bool(physx_bindings.SETTING_UJITSO_COLLISION_COOKING, False)
+
+            carb.log_info("[USDSceneLoader] Disabled UJITSO collision cooking")
         except Exception as e:
             carb.log_warn(f"[USDSceneLoader] Failed to disable collision cooking: {e}")
+
 
     def add_colliders(
         self,
@@ -245,7 +249,7 @@ class USDSceneLoader:
 # Convenience function
 def load_grscenes_scene(
     scene_id: str,
-    grscenes_base_path: str = "/data/GRScenes-100",
+    grscenes_base_path: str = "/home/pggg/InternUtopia/internutopia/assets/scenes/GRScenes-100",
     scene_type: str = "commercial_scenes",
     variant: str = "navigation",
     scene_prim_path: str = "/World/Scene",
