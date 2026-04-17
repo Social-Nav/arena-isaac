@@ -1,6 +1,7 @@
 string name
 string usd_path
 string robot_namespace
+string base_frame
 geometry_msgs/Pose pose
 ---
 string path

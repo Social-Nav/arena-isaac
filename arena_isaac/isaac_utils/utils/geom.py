@@ -254,15 +254,20 @@ def move(
         return
 
     target = None
-    if all(p.HasAPI(UsdPhysics.ArticulationRootAPI) for p in prim.prims):
+    # Prefer RigidPrim when the prim has RigidBodyAPI (even if it also has
+    # ArticulationRootAPI). Using Articulation() triggers PhysX tensor pattern
+    # matching which fails for composite USD robots whose ArticulationRootAPI
+    # is on a non-top-level rigid body. RigidPrim.set_world_poses() on the
+    # articulation root rigid body correctly teleports the entire articulation.
+    if all(p.HasAPI(UsdPhysics.RigidBodyAPI) for p in prim.prims):
         try:
-            target = Articulation(prim_path)
+            target = RigidPrim(prim_path)
         except Exception:
             target = None
 
-    if target is None and all(p.HasAPI(UsdPhysics.RigidBodyAPI) for p in prim.prims):
+    if target is None and all(p.HasAPI(UsdPhysics.ArticulationRootAPI) for p in prim.prims):
         try:
-            target = RigidPrim(prim_path)
+            target = Articulation(prim_path)
         except Exception:
             target = None
 
