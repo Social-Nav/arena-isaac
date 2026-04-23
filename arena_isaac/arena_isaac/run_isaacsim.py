@@ -366,6 +366,53 @@ class IsaacController(rclpy.node.Node):
 from vln_dataset_logger_replicator import VLNDataLoggerReplicator
 import signal
 
+
+def _resolve_vln_dataset_logger_prim_paths(robot_model: str) -> tuple[str, str, str] | None:
+    """Read VLN logger USD prim paths from arena_robots/robots/<model>/model_params.yaml.
+
+    Expected YAML block (optional): ``vln_dataset_logger`` with keys:
+      - robot_stage_name: last segment under /World/Robots/ (e.g. robot0 or Ai2_Bot2)
+      - camera_prim_suffix: path under that robot prim to the Camera prim
+      - lidar_prim_suffix: path under that robot prim to the lidar link prim
+      - pedestrian_root_path: optional, default /World/Pedestrians
+
+    Returns (lidar_path, camera_path, pedestrian_root) or None if unset/incomplete.
+    """
+    try:
+        from ament_index_python.packages import get_package_share_path
+    except Exception:
+        return None
+
+    yaml_path = get_package_share_path('arena_robots') / 'robots' / robot_model / 'model_params.yaml'
+    if not yaml_path.is_file():
+        return None
+
+    try:
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    vln = data.get('vln_dataset_logger')
+    if not isinstance(vln, dict):
+        return None
+
+    stage = vln.get('robot_stage_name')
+    cam_suffix = vln.get('camera_prim_suffix')
+    lidar_suffix = vln.get('lidar_prim_suffix')
+    if not stage or not cam_suffix or not lidar_suffix:
+        return None
+
+    root = os.path.join('/World', 'Robots', str(stage))
+    lidar_path = os.path.join(root, str(lidar_suffix))
+    camera_path = os.path.join(root, str(cam_suffix))
+    ped_root = str(vln.get('pedestrian_root_path') or '/World/Pedestrians')
+    return lidar_path, camera_path, ped_root
+
+
 def main(args=None):
     """
     Main function to initialize the simulation, create the ROS 2 node,
@@ -384,15 +431,29 @@ def main(args=None):
     robot_name = parsed_args.robot
     vln_logger_replicator_cls = None
     # vln_logger_rosbag_cls = None
+
+    vln_paths = _resolve_vln_dataset_logger_prim_paths(robot_name)
+    if vln_paths is None:
+        target_lidar_path = ""
+        target_camera_path = ""
+        target_pedestrian_root_path = "/World/Pedestrians"
+    else:
+        target_lidar_path, target_camera_path, target_pedestrian_root_path = vln_paths
+
+    if enable_logging and vln_paths is None:
+        enable_logging = False
+        sys.stderr.write(
+            "[WARN] VLN logging disabled: missing or incomplete "
+            f"'vln_dataset_logger' in arena_robots/robots/{robot_name}/model_params.yaml "
+            "(need robot_stage_name, camera_prim_suffix, lidar_prim_suffix).\n"
+        )
+        sys.stderr.flush()
     
     # VLN logger state
     logger = None
     frame_step_counter = 0
     has_saved = False
     collecting = False   # True only while robot is actively executing a task
-    target_lidar_path = "/World/Robots/Ai2_Bot2/Ai2_Bot2_Chassis/base_footprint/base_link/lidar_link"
-    target_camera_path = "/World/Robots/Ai2_Bot2/head_link2/camera_link/Camera"
-    target_pedestrian_root_path = "/World/Pedestrians"
     
     if enable_logging:
         try:
