@@ -52,19 +52,30 @@ import numpy as np
 # ensure_pandas_robust()
 # === END ROBUST AUTO-FIX ===
 
-import pandas as pd
-import imageio.v3 as iio
 import os
 import sys
 import json
 import time
 import subprocess
 import signal
+import threading
 
-from omni.isaac.core.utils.prims import get_prim_at_path, get_all_matching_child_prims, is_prim_path_valid
+try:
+    from isaacsim.core.utils.prims import get_prim_at_path, is_prim_path_valid
+except ImportError:
+    from omni.isaac.core.utils.prims import get_prim_at_path, is_prim_path_valid
+
+try:
+    from isaacsim.core.experimental.prims import XformPrim as XFormPrim
+except ImportError:
+    from omni.isaac.core.prims import XFormPrim
+
+try:
+    from isaacsim.core.api.simulation_context import SimulationContext
+except ImportError:
+    from omni.isaac.core import SimulationContext
+
 from scipy.spatial.transform import Rotation as R
-from omni.isaac.core.prims import XFormPrim
-from omni.isaac.core import SimulationContext
 # from mcap_ros2.ros2_decoding import DecoderFactory
 # from mcap_ros2.writer import Writer as Ros2Writer
 
@@ -99,11 +110,22 @@ class VLNDataLoggerReplicator:
             sys.stderr.write(f"[OK] Camera path found: {camera_prim_path}\n")
 
         self.output_dir = output_dir
+
+        # Create timestamped session dir only when logger is instantiated (save_data=true)
+        import datetime
+        session_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.session_dir = os.path.join(output_dir, session_name)
+        old_umask = os.umask(0)
+        os.makedirs(self.session_dir, mode=0o777, exist_ok=True)
+        os.umask(old_umask)
+
         self.episode_idx = 0
         self.param_buffer = []
         self.rgb_frame_buffer = []
         self.depth_frame_buffer = []
-        
+        self._stream_chunk_idx = 0
+        self._pending_saves = []
+
         # Create render product for camera
         self.camera_rp = rep.create.render_product(camera_prim_path, (1280, 720))
         
@@ -132,11 +154,6 @@ class VLNDataLoggerReplicator:
         except Exception as e:
             sys.stderr.write(f"⚠️ LIDAR Annotator initialization failed: {e}\n")
             self.lidar_annot = None'''
-
-        os.makedirs(os.path.join(self.output_dir, "data"), exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, "rgb_videos"), exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, "depth_videos"), exist_ok=True)
-        # os.makedirs(os.path.join(self.output_dir, "ply"), exist_ok=True)
 
         # Initialize pedestrian list
         self.pedestrian_prims = []
@@ -659,17 +676,64 @@ class VLNDataLoggerReplicator:
             # self.json_write_points(points, sim_time, frame_id="jackal/base_link")
 
             # === Confirm buffer increased ===
-            if len(self.param_buffer) % 10 == 0:
+            if len(self.param_buffer) % 50 == 0:
                 sys.stderr.write(f"✓ Captured frames: {len(self.param_buffer)}\n")
                 sys.stderr.flush()
+
+            # === Stream flush: write image chunks to disk to bound memory usage ===
+            if len(self.rgb_frame_buffer) >= 300:
+                self._flush_stream_chunk()
+
         except Exception as e:
             sys.stderr.write(f"Buffer data error: {e}\n")
 
         return
 
+    def _flush_stream_chunk(self):
+        """Flush current image buffers to a numbered chunk file on disk, freeing memory."""
+        if not self.rgb_frame_buffer:
+            return
+
+        ep_idx = self.episode_idx
+        chunk_idx = self._stream_chunk_idx
+
+        rgb_frames = self.rgb_frame_buffer
+        depth_frames = self.depth_frame_buffer
+
+        self.rgb_frame_buffer = []
+        self.depth_frame_buffer = []
+        self._stream_chunk_idx += 1
+
+        ep_dir = os.path.join(self.session_dir, f"episode_{ep_idx:06d}")
+        old_umask = os.umask(0)
+        os.makedirs(os.path.join(ep_dir, "rgb_videos"),   mode=0o777, exist_ok=True)
+        os.makedirs(os.path.join(ep_dir, "depth_videos"), mode=0o777, exist_ok=True)
+        os.umask(old_umask)
+
+        rgb_path   = os.path.join(ep_dir, "rgb_videos",   f"chunk_{chunk_idx:04d}.npy")
+        depth_path = os.path.join(ep_dir, "depth_videos", f"chunk_{chunk_idx:04d}.npy")
+
+        sys.stderr.write(f"[Flush] ep={ep_idx:06d} chunk={chunk_idx:04d} ({len(rgb_frames)} frames)\n")
+        sys.stderr.flush()
+
+        def _write():
+            try:
+                np.save(rgb_path,   np.stack(rgb_frames))
+                np.save(depth_path, np.stack(depth_frames))
+                sys.stderr.write(f"[Flush] chunk {ep_idx:06d}/{chunk_idx:04d} saved.\n")
+            except Exception as e:
+                sys.stderr.write(f"[Flush] chunk {ep_idx:06d}/{chunk_idx:04d} failed: {e}\n")
+            sys.stderr.flush()
+
+        t = threading.Thread(target=_write, daemon=True, name=f"flush-ep{ep_idx}-ch{chunk_idx}")
+        self._pending_saves.append(t)
+        t.start()
+
     def save_episode(self):
         """
-        Call at the end of an episode
+        Call at the end of an episode.
+        Flushes any remaining image frames as a final chunk, then saves the JSON params.
+        Image data is written in bounded chunks (300 frames each) to prevent OOM.
         """
         sys.stderr.write(f"\n[Save] Save triggered. Chunk buffer size: {len(self.param_buffer)}\n")
         sys.stderr.flush()
@@ -678,37 +742,35 @@ class VLNDataLoggerReplicator:
             sys.stderr.flush()
             return
 
-        # Save videos and metadata
-        rgb_video_path = os.path.join(self.output_dir, f"rgb_videos/episode_{self.episode_idx:06d}.mp4")
-        iio.imwrite(rgb_video_path, np.stack(self.rgb_frame_buffer), fps=30, codec="libx264")
-        
-        depth_video_path = os.path.join(self.output_dir, f"depth_videos/episode_{self.episode_idx:06d}.mp4")
-        iio.imwrite(depth_video_path, np.stack(self.depth_frame_buffer), fps=30, codec="libx264")
+        # Flush remaining image frames as final chunk
+        self._flush_stream_chunk()
 
-        df = pd.DataFrame(self.param_buffer)
-        parquet_path = os.path.join(self.output_dir, f"data/chunk_{self.episode_idx:06d}.parquet")
-        df.to_parquet(parquet_path)
-        
-        # self._start_rosbag_record()
+        param_buf   = self.param_buffer
+        episode_idx = self.episode_idx
+        n_chunks    = self._stream_chunk_idx  # total chunks written for this episode
 
-        # Save and close JSON
-        # self.json_close()
-        # Save and close MCAP point cloud file
-        '''if getattr(self, "_lidar_writer", None) is not None:
-            try:
-                self._lidar_close()
-                sys.stderr.write(f"[Save] ✅ LIDAR point cloud saved\n")
-            except Exception as e:
-                sys.stderr.write(f"[Save] ❌ Failed to close LIDAR file: {e}\n")
-            # Re-initialize for next episode
-            if HAS_MCAP:
-                self._init_lidar_writer()
-        
-        sys.stderr.write(f"[Save] Episode {self.episode_idx:06d} saved\n")'''
-        sys.stderr.flush()
-
-        # Reset buffers
         self.episode_idx += 1
         self.param_buffer = []
-        self.rgb_frame_buffer = []
-        self.depth_frame_buffer = []
+        self._stream_chunk_idx = 0
+
+        ep_dir = os.path.join(self.session_dir, f"episode_{episode_idx:06d}")
+        old_umask = os.umask(0)
+        os.makedirs(os.path.join(ep_dir, "data"), mode=0o777, exist_ok=True)
+        os.umask(old_umask)
+        json_path = os.path.join(ep_dir, "data", "params.json")
+
+        def _write():
+            try:
+                with open(json_path, "w") as f:
+                    json.dump(param_buf, f)
+                sys.stderr.write(f"[Save] Episode {episode_idx:06d} saved ({len(param_buf)} frames, {n_chunks} image chunks).\n")
+            except Exception as e:
+                sys.stderr.write(f"[Save] Episode {episode_idx:06d} JSON failed: {e}\n")
+            sys.stderr.flush()
+
+        t = threading.Thread(target=_write, daemon=True, name=f"save-ep{episode_idx}")
+        self._pending_saves.append(t)
+        t.start()
+        sys.stderr.write(f"[Save] Background save started for episode {episode_idx:06d} ({n_chunks} chunks).\n")
+        sys.stderr.flush()
+

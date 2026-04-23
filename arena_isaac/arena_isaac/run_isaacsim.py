@@ -110,7 +110,10 @@ for _ in range(100):
 # -------------------------------------------------------------------------------------------------
 omni.usd.get_context().new_stage()
 
-from omni.isaac.core.utils.prims import define_prim
+try:
+    from isaacsim.core.utils.prims import define_prim
+except ImportError:
+    from omni.isaac.core.utils.prims import define_prim
 
 # 显式定义根节点和分类容器，防止服务调用时这些路径不存在
 define_prim("/World", "Xform")
@@ -138,6 +141,8 @@ import omni.syntheticdata._syntheticdata as sd
 import rclpy
 import rclpy.node
 import std_srvs.srv
+import std_msgs.msg
+import action_msgs.msg
 
 # graphs
 from isaac_utils.graphs.time import PublishTime
@@ -358,7 +363,8 @@ class IsaacController(rclpy.node.Node):
 
 
 # ======================================main=======================================
-
+from vln_dataset_logger_replicator import VLNDataLoggerReplicator
+import signal
 
 def main(args=None):
     """
@@ -368,21 +374,33 @@ def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--save-data', type=str, default='false',
                        help='Enable VLN dataset logging')
+    parser.add_argument('--robot', type=str, default='jackal',
+                       help='Robot name used in task_generator topic namespace')
     parser.add_argument('--log-level', type=str, default='info',
                        help='log level for IsaacSim (debug/info/warn/error)')
     parsed_args = parser.parse_args(args)
 
     enable_logging = parsed_args.save_data.lower() == 'true'
+    robot_name = parsed_args.robot
     vln_logger_replicator_cls = None
-    vln_logger_rosbag_cls = None
-
+    # vln_logger_rosbag_cls = None
+    
+    # VLN logger state
+    logger = None
+    frame_step_counter = 0
+    has_saved = False
+    collecting = False   # True only while robot is actively executing a task
+    target_lidar_path = "/World/Robots/Ai2_Bot2/Ai2_Bot2_Chassis/base_footprint/base_link/lidar_link"
+    target_camera_path = "/World/Robots/Ai2_Bot2/head_link2/camera_link/Camera"
+    target_pedestrian_root_path = "/World/Pedestrians"
+    
     if enable_logging:
         try:
             from vln_dataset_logger_replicator import VLNDataLoggerReplicator
-            from vln_dataset_logger_rosbag import VLNDataLoggerRosbag
+            # from vln_dataset_logger_rosbag import VLNDataLoggerRosbag
 
             vln_logger_replicator_cls = VLNDataLoggerReplicator
-            vln_logger_rosbag_cls = VLNDataLoggerRosbag
+            # vln_logger_rosbag_cls = VLNDataLoggerRosbag
             sys.stderr.write(
                 "[INFO] VLN logging modules loaded successfully.\n"
             )
@@ -409,6 +427,95 @@ def main(args=None):
     rclpy.init()
     controller = IsaacController()
 
+    # Subscribe to task lifecycle events to control when data collection happens
+    def _on_task_reset(msg: std_msgs.msg.Int16):
+        """task_generator fires this after each reset — treat as episode START.
+        If there is leftover data from an interrupted episode, save it first."""
+        nonlocal collecting, frame_step_counter
+        if not enable_logging or logger is None:
+            return
+
+        episode_num = msg.data
+
+        def _start_episode():
+            nonlocal collecting, frame_step_counter
+            # Save leftover buffer if robot was interrupted mid-task
+            if len(logger.param_buffer) > 0:
+                sys.stderr.write(f"[TaskReset #{episode_num}] Saving interrupted episode ({len(logger.param_buffer)} frames)...\n")
+                try:
+                    logger.save_episode()
+                except Exception as e:
+                    sys.stderr.write(f"[TaskReset #{episode_num}] Save failed: {e}\n")
+            frame_step_counter = 0
+            collecting = True
+            sys.stderr.write(f"[TaskReset #{episode_num}] Episode started, collecting data.\n")
+            sys.stderr.flush()
+
+        run_after_tick_queue.put_nowait(_start_episode)
+
+    def _on_nav_status(msg: action_msgs.msg.GoalStatusArray):
+        """Nav2 action status — save and stop collecting on any terminal state."""
+        nonlocal collecting
+        if not enable_logging or logger is None or not collecting:
+            return
+        last = next(reversed(list(msg.status_list)), None)
+        if last is None:
+            return
+        status = last.status
+        terminal = frozenset({
+            action_msgs.msg.GoalStatus.STATUS_SUCCEEDED,
+            action_msgs.msg.GoalStatus.STATUS_ABORTED,
+            action_msgs.msg.GoalStatus.STATUS_CANCELED,
+        })
+        if status not in terminal:
+            return
+        label = "SUCCEEDED" if status == action_msgs.msg.GoalStatus.STATUS_SUCCEEDED else "ABORTED/CANCELED"
+
+        def _end_episode():
+            nonlocal collecting
+            collecting = False
+            if len(logger.param_buffer) == 0:
+                return
+            sys.stderr.write(f"[NavStatus {label}] Saving episode ({len(logger.param_buffer)} frames)...\n")
+            try:
+                logger.save_episode()
+                sys.stderr.write(f"[NavStatus {label}] Save complete.\n")
+            except Exception as e:
+                sys.stderr.write(f"[NavStatus {label}] Save failed: {e}\n")
+            sys.stderr.flush()
+
+        run_after_tick_queue.put_nowait(_end_episode)
+
+    def _on_finished(_msg: std_msgs.msg.Empty):
+        """Fired when all desired episodes are done — save whatever remains."""
+        nonlocal collecting
+        if not enable_logging or logger is None:
+            return
+
+        def _save():
+            nonlocal collecting
+            collecting = False
+            if len(logger.param_buffer) == 0:
+                return
+            sys.stderr.write(f"[Finished] Saving final episode ({len(logger.param_buffer)} frames)...\n")
+            try:
+                logger.save_episode()
+                sys.stderr.write("[Finished] Final save complete.\n")
+            except Exception as e:
+                sys.stderr.write(f"[Finished] Final save failed: {e}\n")
+            sys.stderr.flush()
+
+        run_after_tick_queue.put_nowait(_save)
+
+    controller.create_subscription(
+        std_msgs.msg.Int16, '/task_generator_node/task_reset', _on_task_reset, 10)
+    controller.create_subscription(
+        action_msgs.msg.GoalStatusArray,
+        f'/task_generator_node/{robot_name}/navigate_to_pose/_action/status',
+        _on_nav_status, 1)
+    controller.create_subscription(
+        std_msgs.msg.Empty, '/task_generator_node/finished', _on_finished, 10)
+
     door_manager = DoorManager.instance(controller)
     elevator_manager.register_node(controller)  # Register controller for odom subscriptions
     for service in services:
@@ -424,6 +531,31 @@ def main(args=None):
     PublishTime('/World/publish_time')
     world.reset()
 
+    # Replicator
+    #处理Ctrl+C 退出
+    # def emergency_save_handler(signum, frame):        
+    #     nonlocal has_saved
+    #     sys.stderr.write(f"\n[URGENT] 收到终止信号 ({signum})! 正在保存数据...\n")
+    #     sys.stderr.flush()
+        
+    #     if not has_saved and logger and len(logger.param_buffer) > 0:
+    #         try:
+    #             # 强制保存
+    #             logger.save_episode()
+    #             has_saved = True  # 标记已保存
+    #             sys.stderr.write("[URGENT] ✅ 数据保存成功！\n")
+    #         except Exception as e:
+    #             sys.stderr.write(f"[URGENT] ❌ 保存失败: {e}\n")
+    #     else:
+    #         sys.stderr.write("[URGENT] Buffer 为空，无需保存。\n")
+        
+    #     sys.stderr.flush()
+    #     # 保存完后，手动退出程序
+    #     sys.exit(0)
+        
+    # signal.signal(signal.SIGINT, emergency_save_handler)
+    # signal.signal(signal.SIGTERM, emergency_save_handler)
+    # signal.signal(signal.SIGHUP, emergency_save_handler)   # docker exec 断开时触发
     # set photoreal settings
     import isaac_utils.config.photoreal as photoreal
     if os.environ.get('RENDER_PRESET', 'photoreal') != 'boring':
@@ -452,43 +584,51 @@ def main(args=None):
                 # Start data collection and saving
                 if enable_logging:
                     # Check every 50 frames whether the robot appears
-                    if logger is None and frame_step_counter % 50 == 0:
-
-                        if is_prim_path_valid(target_camera_path):
-                            try:
-                                logger = vln_logger_replicator_cls(camera_prim_path=target_camera_path, pedestrian_root_path = target_pedestrian_root_path, lidar_prim_path=target_lidar_path) # replicator logic
-                                '''
-                                logger = vln_logger_rosbag_cls(
-                                    topics=[
-                                        "/task_generator_node/jackal/odom",
-                                        "/task_generator_node/jackal/front_camera/camera_info",
-                                        "/task_generator_node/jackal/front_camera/image",
-                                        "/task_generator_node/jackal/front_camera/depth",
-                                        "/task_generator_node/jackal/lidar/points",
-                                        "/task_generator_node/human_states",
-                                        "/tf",
-                                        "/tf_static",
-                                    ],
-                                    output_dir="collected_data"
+                    if logger is None:
+                        if frame_step_counter % 50 == 0:
+                            if is_prim_path_valid(target_camera_path):
+                                try:
+                                    _script_dir = os.path.dirname(os.path.abspath(__file__))
+                                    _output_dir = os.path.normpath(os.path.join(_script_dir, "../../../src/Arena/collected_data"))
+                                    logger = vln_logger_replicator_cls(
+                                        camera_prim_path=target_camera_path,
+                                        pedestrian_root_path=target_pedestrian_root_path,
+                                        lidar_prim_path=target_lidar_path,
+                                        output_dir=_output_dir,
                                     )
-                                logger.start_recording()  # start rosbag recording
-                                rosbag_process = logger.process  # rosbag logic
-                                controller.get_logger().info('✅ VLNDataLoggerRosbag initialized successfully')
-                                '''
-                            except Exception as e:
-                                sys.stderr.write(f"\n VLNDataLogger initialization failed: {e}\n")
-                        else:
-                            if frame_step_counter % 300 == 0:
-                                sys.stderr.write(f" Waiting for robot spawn... searching path: {target_camera_path}")
-                    if logger:
-                        try:
-                            logger.step(step_idx=frame_step_counter) # replicator logic
-                            frame_step_counter += 1  # increment after each capture
+                                    sys.stderr.write(f"\n [Logger] Output dir: {_output_dir}\n")
+                                    '''
+                                    logger = vln_logger_rosbag_cls(
+                                        topics=[
+                                            "/task_generator_node/jackal/odom",
+                                            "/task_generator_node/jackal/front_camera/camera_info",
+                                            "/task_generator_node/jackal/front_camera/image",
+                                            "/task_generator_node/jackal/front_camera/depth",
+                                            "/task_generator_node/jackal/lidar/points",
+                                            "/task_generator_node/human_states",
+                                            "/tf",
+                                            "/tf_static",
+                                        ],
+                                        output_dir="collected_data"
+                                        )
+                                    logger.start_recording()  # start rosbag recording
+                                    rosbag_process = logger.process  # rosbag logic
+                                    controller.get_logger().info('Rosbag Logger initialized successfully')
+                                    '''
+                                except Exception as e:
+                                    sys.stderr.write(f"\n VLNDataLogger initialization failed: {e}\n")
+                            elif frame_step_counter % 300 == 0:
+                                sys.stderr.write(f" Waiting for robot spawn... searching path: {target_camera_path}\n")
+                    else:
+                        if collecting:
+                            try:
+                                logger.step(step_idx=frame_step_counter) # replicator logic
+                                frame_step_counter += 1  # increment after each capture
 
-                        except Exception as e:
-                            # Force stack trace to stderr
-                            sys.stderr.write(f"\n🔥 Logger step crashed: {e}\n")
-                            traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)
+                            except Exception as e:
+                                # Force stack trace to stderr
+                                sys.stderr.write(f"\nLogger step crashed: {e}\n")
+                                traceback.print_exception(type(e), e, e.__traceback__, file=sys.stderr)
                             sys.stderr.flush()
             else:
                 if was_playing:
@@ -524,7 +664,8 @@ def main(args=None):
                 has_saved = True
                 sys.stderr.write("[SAVE] Save complete!\n")
             else:
-                pass
+                sys.stderr.write("[INFO] Logger not initialized or already saved.\n")
+        
         sys.stderr.write("[Finally] Shutting down ROS 2 node and simulation....\n")
         if controller is not None:
             controller.destroy_node()
