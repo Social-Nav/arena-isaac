@@ -32,66 +32,24 @@ TF_DETECT_KEYWORDS = {'parentframeid', 'childframeid'}
 NAMESPACE_KEYWORDS = {'nodenamespace'}
 
 
-def _find_articulation_root(prim_path: str, base_frame: str = '') -> str | None:
-    """Find the physics root prim for an articulation.
+def _find_articulation_root(prim_path: str) -> str | None:
+    """Return the path of the prim that carries both ArticulationRootAPI and
+    RigidBodyAPI — the PhysX articulation root body (e.g. base_link).
 
-    When ArticulationRootAPI is applied to a non-rigid-body Xform (e.g. the
-    top-level robot prim), Isaac Sim's Articulation.set_world_poses() may not
-    reliably teleport the robot because there is no explicit root body to move.
-    In that case, if *base_frame* is provided, the hierarchy is searched for a
-    prim whose USD name matches base_frame and that carries RigidBodyAPI.  This
-    gives us a concrete physics body (e.g. base_footprint on the chassis) whose
-    world pose can be set deterministically.
-
-    Search order:
-    1. The first prim whose name equals *base_frame* and has RigidBodyAPI.
-       This keeps the published odom child frame aligned with the configured
-       robot base frame for composite USD robots.
-    2. Any prim that has BOTH ArticulationRootAPI AND RigidBodyAPI.
-    3. The first prim with ArticulationRootAPI (original fallback).
+    Returns None if no such prim exists under prim_path.
     """
     stage = omni.usd.get_context().get_stage()
     root_prim = stage.GetPrimAtPath(prim_path)
     if not root_prim.IsValid():
         return None
 
-    articulation_xform_path: str | None = None
-    articulation_rigid_body_path: str | None = None
-    base_frame_path: str | None = None
-
     for prim in Usd.PrimRange(root_prim):
-        has_articulation = prim.HasAPI(UsdPhysics.ArticulationRootAPI)
-        has_rigid_body = prim.HasAPI(UsdPhysics.RigidBodyAPI)
+        if prim.HasAPI(UsdPhysics.ArticulationRootAPI) and prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            return str(prim.GetPath())
 
-        if has_articulation and has_rigid_body and articulation_rigid_body_path is None:
-            articulation_rigid_body_path = str(prim.GetPath())
+    return None
 
-        if has_articulation and articulation_xform_path is None:
-            articulation_xform_path = str(prim.GetPath())
 
-        if base_frame and base_frame_path is None:
-            if prim.GetName() == base_frame and has_rigid_body:
-                base_frame_path = str(prim.GetPath())
-
-    if base_frame_path is not None:
-        if articulation_rigid_body_path and articulation_rigid_body_path != base_frame_path:
-            carb.log_warn(
-                f"[SpawnUsdRobot] Using configured base_frame '{base_frame}' rigid body "
-                f"for odom/root alignment instead of articulation root body "
-                f"{articulation_rigid_body_path}: {base_frame_path}"
-            )
-        elif articulation_xform_path and articulation_rigid_body_path is None:
-            carb.log_warn(
-                f"[SpawnUsdRobot] ArticulationRoot is on a non-body prim "
-                f"({articulation_xform_path}); using base_frame '{base_frame}' "
-                f"rigid body instead: {base_frame_path}"
-            )
-        return base_frame_path
-
-    if articulation_rigid_body_path is not None:
-        return articulation_rigid_body_path
-
-    return articulation_xform_path
 
 
 def _has_odom_publisher(prim_path: str, odom_topic: str) -> bool:
@@ -468,15 +426,14 @@ def spawn_usd_robot(request: SpawnUsdRobot.Request) -> str:
     except Exception as e:
         carb.log_error(f"[SpawnUsdRobot] app.update() failed: {e}")
 
-    articulation_prim_path = _find_articulation_root(prim_path, base_frame=base_frame)
+    articulation_prim_path = _find_articulation_root(prim_path)
     if articulation_prim_path is None:
-        carb.log_warn(
-            f"[SpawnUsdRobot] No ArticulationRootAPI found, "
-            f"falling back to prim_path"
+        carb.log_error(
+            f"[SpawnUsdRobot] No prim with both ArticulationRootAPI and RigidBodyAPI "
+            f"found under {prim_path}. Spawn aborted."
         )
-        articulation_prim_path = prim_path
-    else:
-        carb.log_warn(f"[SpawnUsdRobot] Articulation root at: {articulation_prim_path}")
+        return ''
+    carb.log_warn(f"[SpawnUsdRobot] Articulation root at: {articulation_prim_path}")
 
     try:
         _remap_namespace(prim_path, namespace, base_frame=base_frame)

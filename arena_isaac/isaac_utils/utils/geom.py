@@ -54,6 +54,7 @@ def _resolve_robot(prim_path: str) -> str:
         return _robot_articulation_registry.get(normalized_path, normalized_path)
 
 
+
 @attrs.define
 class Translation:
     x: float
@@ -240,6 +241,66 @@ class Scale:
         )
 
 
+def _teleport_articulation(
+    art_path: str,
+    container_path: str,
+    translation: Translation | None,
+    rotation: Rotation | None,
+):
+    """Teleport an articulation to a new world pose.
+
+    Two operations are always performed:
+
+    1. XformPrim(container_path).set_world_poses() — moves the top-level robot
+       Xform in USD. At spawn time (before physics starts) PhysX reads the USD
+       Xform position at initialization, so this is the only reliable way to
+       place the robot when ArticulationRoot is on a RigidBody child (new-style
+       USD). When container_path == art_path this step is skipped.
+
+    2. Articulation(art_path).set_world_poses() — calls PhysX
+       PxArticulation::setRootGlobalPose() to move the live physics body. This
+       is a no-op at spawn (physics not yet started) but is the only effective
+       call at reset time (physics already running; USD Xform changes are
+       ignored by the solver).
+
+    No Z offset is applied: ArticulationRoot is on the base_link RigidBody
+    whose USD-local pose already encodes the correct wheel-to-ground offset.
+    Setting Z=0 places the robot exactly at ground level.
+    """
+    pos_arr = np.array(np.atleast_2d(translation.tuple())) if translation is not None else None
+    rot_arr = np.array(np.atleast_2d(rotation.quat())) if rotation is not None else None
+
+    carb.log_warn(
+        f"[geom.move] teleport: art={art_path}, container={container_path}, "
+        f"translation={translation}"
+    )
+
+    # Step 1: move the top-level container Xform (required for correct spawn position).
+    if container_path != art_path:
+        try:
+            XformPrim(container_path).set_world_poses(pos_arr, rot_arr)
+        except Exception as e:
+            carb.log_warn(f"[geom.move] container Xform move failed: {e}")
+
+    # Step 2: teleport the PhysX articulation (required for correct reset position).
+    try:
+        art = Articulation(art_path)
+        art.set_world_poses(pos_arr, rot_arr)
+        try:
+            art.set_linear_velocities(np.zeros((1, 3)))
+            art.set_angular_velocities(np.zeros((1, 3)))
+        except Exception:
+            pass
+        try:
+            joint_vels = art.get_joint_velocities()
+            if joint_vels is not None:
+                art.set_joint_velocities(np.zeros_like(joint_vels))
+        except Exception:
+            pass
+    except Exception as e:
+        carb.log_warn(f"[geom.move] Articulation({art_path}).set_world_poses FAILED: {e}")
+
+
 def move(
     prim_path: str,
     *,
@@ -247,42 +308,38 @@ def move(
     rotation: Rotation | None = None,
     local: bool = False,
 ):
+    container_path = prim_path          # top-level robot Xform before registry resolve
     prim_path = _resolve_robot(prim_path)
     prim = Prim([prim_path])
 
     if not prim.valid:
+        carb.log_warn(f"[geom.move] prim not valid: {prim_path}")
         return
 
+    # Articulation (world-space): use direct PhysX interface on root body.
+    if (not local) and all(p.HasAPI(UsdPhysics.ArticulationRootAPI) for p in prim.prims):
+        _teleport_articulation(prim_path, container_path, translation, rotation)
+        return
+
+    # Non-articulation or local-space fallback (RigidPrim / XformPrim).
     target = None
-    # Prefer RigidPrim when the prim has RigidBodyAPI (even if it also has
-    # ArticulationRootAPI). Using Articulation() triggers PhysX tensor pattern
-    # matching which fails for composite USD robots whose ArticulationRootAPI
-    # is on a non-top-level rigid body. RigidPrim.set_world_poses() on the
-    # articulation root rigid body correctly teleports the entire articulation.
     if all(p.HasAPI(UsdPhysics.RigidBodyAPI) for p in prim.prims):
         try:
             target = RigidPrim(prim_path)
         except Exception:
             target = None
-
-    if target is None and all(p.HasAPI(UsdPhysics.ArticulationRootAPI) for p in prim.prims):
-        try:
-            target = Articulation(prim_path)
-        except Exception:
-            target = None
-
     if target is None:
         target = XformPrim(prim_path)
 
     if local:
         target.set_local_poses(
             np.array(np.atleast_2d(translation.tuple())) if translation is not None else None,
-            np.array(np.atleast_2d(rotation.quat())) if rotation is not None else None
+            np.array(np.atleast_2d(rotation.quat())) if rotation is not None else None,
         )
     else:
         target.set_world_poses(
             np.array(np.atleast_2d(translation.tuple())) if translation is not None else None,
-            np.array(np.atleast_2d(rotation.quat())) if rotation is not None else None
+            np.array(np.atleast_2d(rotation.quat())) if rotation is not None else None,
         )
 
 

@@ -515,7 +515,7 @@ def main(args=None):
         run_after_tick_queue.put_nowait(_start_episode)
 
     def _on_nav_status(msg: action_msgs.msg.GoalStatusArray):
-        """Nav2 action status — save and stop collecting on any terminal state."""
+        """Nav2 action status — save on success, discard on abort/cancel."""
         nonlocal collecting
         if not enable_logging or logger is None or not collecting:
             return
@@ -530,11 +530,21 @@ def main(args=None):
         })
         if status not in terminal:
             return
-        label = "SUCCEEDED" if status == action_msgs.msg.GoalStatus.STATUS_SUCCEEDED else "ABORTED/CANCELED"
+        succeeded = status == action_msgs.msg.GoalStatus.STATUS_SUCCEEDED
+        label = "SUCCEEDED" if succeeded else "ABORTED/CANCELED"
 
         def _end_episode():
             nonlocal collecting
             collecting = False
+            if not succeeded:
+                sys.stderr.write(f"[NavStatus {label}] Discarding episode...\n")
+                try:
+                    logger.discard_episode()
+                    sys.stderr.write(f"[NavStatus {label}] Discard complete.\n")
+                except Exception as e:
+                    sys.stderr.write(f"[NavStatus {label}] Discard failed: {e}\n")
+                sys.stderr.flush()
+                return
             if len(logger.param_buffer) == 0:
                 return
             sys.stderr.write(f"[NavStatus {label}] Saving episode ({len(logger.param_buffer)} frames)...\n")
@@ -649,8 +659,10 @@ def main(args=None):
                         if frame_step_counter % 50 == 0:
                             if is_prim_path_valid(target_camera_path):
                                 try:
-                                    _script_dir = os.path.dirname(os.path.abspath(__file__))
-                                    _output_dir = os.path.normpath(os.path.join(_script_dir, "../../../src/Arena/collected_data"))
+                                    _p = Path(__file__).resolve()
+                                    while _p.name != 'Arena' and _p.parent != _p:
+                                        _p = _p.parent
+                                    _output_dir = str(_p / 'collected_data')
                                     logger = vln_logger_replicator_cls(
                                         camera_prim_path=target_camera_path,
                                         pedestrian_root_path=target_pedestrian_root_path,
@@ -726,6 +738,8 @@ def main(args=None):
                 sys.stderr.write("[SAVE] Save complete!\n")
             else:
                 sys.stderr.write("[INFO] Logger not initialized or already saved.\n")
+            if logger:
+                logger.wait_for_pending_saves(timeout=60.0)
         
         sys.stderr.write("[Finally] Shutting down ROS 2 node and simulation....\n")
         if controller is not None:

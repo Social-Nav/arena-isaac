@@ -95,7 +95,7 @@ def convert_session(session_dir: str, delete_src: bool, fps: int):
         if os.path.isdir(rgb_dir):
             frames, src_paths = _load_chunks(rgb_dir)
             if frames is not None:
-                mp4_path = os.path.join(rgb_dir, "video.mp4")
+                mp4_path = os.path.join(rgb_dir, "rgb_video.mp4")
                 iio.imwrite(mp4_path, _npy_to_uint8(frames), fps=fps, codec="libx264")
                 print(f"  npy→mp4 (RGB):   {ep_label} ({len(frames)} frames, {len(src_paths)} chunks)")
                 if delete_src:
@@ -107,7 +107,7 @@ def convert_session(session_dir: str, delete_src: bool, fps: int):
         if os.path.isdir(depth_dir):
             frames, src_paths = _load_chunks(depth_dir)
             if frames is not None:
-                mp4_path = os.path.join(depth_dir, "video.mp4")
+                mp4_path = os.path.join(depth_dir, "depth_video.mp4")
                 iio.imwrite(mp4_path, _npy_to_uint8(frames), fps=fps, codec="libx264")
                 print(f"  npy→mp4 (Depth): {ep_label} ({len(frames)} frames, {len(src_paths)} chunks)")
                 if delete_src:

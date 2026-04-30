@@ -681,7 +681,7 @@ class VLNDataLoggerReplicator:
                 sys.stderr.flush()
 
             # === Stream flush: write image chunks to disk to bound memory usage ===
-            if len(self.rgb_frame_buffer) >= 300:
+            if len(self.rgb_frame_buffer) >= 500:
                 self._flush_stream_chunk()
 
         except Exception as e:
@@ -733,7 +733,7 @@ class VLNDataLoggerReplicator:
         """
         Call at the end of an episode.
         Flushes any remaining image frames as a final chunk, then saves the JSON params.
-        Image data is written in bounded chunks (300 frames each) to prevent OOM.
+        Image data is written in bounded chunks (500 frames each) to prevent OOM.
         """
         sys.stderr.write(f"\n[Save] Save triggered. Chunk buffer size: {len(self.param_buffer)}\n")
         sys.stderr.flush()
@@ -773,4 +773,61 @@ class VLNDataLoggerReplicator:
         t.start()
         sys.stderr.write(f"[Save] Background save started for episode {episode_idx:06d} ({n_chunks} chunks).\n")
         sys.stderr.flush()
+
+    def discard_episode(self):
+        """Discard current episode on abort/cancel.
+
+        Waits for any in-flight chunk-flush threads, deletes all written files
+        under the episode directory, clears in-memory buffers, and advances
+        episode_idx. The episode folder itself is kept as an abort marker.
+        """
+        ep_idx = self.episode_idx
+        ep_dir = os.path.join(self.session_dir, f"episode_{ep_idx:06d}")
+
+        # Clear in-memory buffers immediately
+        self.param_buffer = []
+        self.rgb_frame_buffer = []
+        self.depth_frame_buffer = []
+
+        # Wait for in-flight flush threads belonging to this episode
+        prefix = f"flush-ep{ep_idx:06d}-"
+        ep_threads = [t for t in self._pending_saves if t.name.startswith(prefix)]
+        for t in ep_threads:
+            t.join(timeout=10.0)
+        self._pending_saves = [t for t in self._pending_saves if t.is_alive()]
+
+        # Delete all files, keep the subdirectory structure
+        deleted = 0
+        for subdir in ("rgb_videos", "depth_videos", "data"):
+            subdir_path = os.path.join(ep_dir, subdir)
+            if not os.path.isdir(subdir_path):
+                continue
+            for fname in os.listdir(subdir_path):
+                fpath = os.path.join(subdir_path, fname)
+                try:
+                    os.remove(fpath)
+                    deleted += 1
+                except Exception as e:
+                    sys.stderr.write(f"[Discard] Failed to delete {fpath}: {e}\n")
+
+        self._stream_chunk_idx = 0
+        self.episode_idx += 1
+        sys.stderr.write(
+            f"[Discard] Episode {ep_idx:06d} discarded "
+            f"({deleted} file(s) deleted, folder kept).\n"
+        )
+        sys.stderr.flush()
+
+    def wait_for_pending_saves(self, timeout: float = 60.0):
+        """Block until all background save threads finish (or timeout expires)."""
+        alive = [t for t in self._pending_saves if t.is_alive()]
+        if alive:
+            sys.stderr.write(f"[Save] Waiting for {len(alive)} background save thread(s)...\n")
+            sys.stderr.flush()
+        for t in alive:
+            t.join(timeout=timeout)
+            if t.is_alive():
+                sys.stderr.write(f"[Save] WARNING: thread {t.name} did not finish within {timeout}s\n")
+                sys.stderr.flush()
+        self._pending_saves = [t for t in self._pending_saves if t.is_alive()]
 
