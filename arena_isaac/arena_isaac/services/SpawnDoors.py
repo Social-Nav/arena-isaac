@@ -95,7 +95,11 @@ def spawn_door(door: Door) -> bool:
 
 def spawn_doors_callback(request: SpawnDoors.Request, response: SpawnDoors.Response):
     response.ret = list(map(spawn_door, request.doors))
-    return response
+    carb.log_warn(
+        f"[SpawnDoors] Spawned {sum(1 for ok in response.ret if ok)}/{len(response.ret)} door(s); "
+        "suppressing ROS response to avoid Isaac embedded rclpy response conversion abort"
+    )
+    raise RuntimeError('SpawnDoors response intentionally suppressed after spawn setup')
 
 
 spawn_doors_service = Service(

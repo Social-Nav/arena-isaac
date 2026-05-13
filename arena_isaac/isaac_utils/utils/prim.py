@@ -1,6 +1,9 @@
 import os
 from pxr import Usd, UsdGeom
-from isaacsim.core.utils.prims import create_prim
+try:
+    from isaacsim.core.utils.prims import create_prim
+except ImportError:
+    from omni.isaac.core.utils.prims import create_prim
 from typing import Optional
 
 import omni.usd

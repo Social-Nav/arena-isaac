@@ -1,5 +1,6 @@
 from geometry_msgs.msg import Pose
 
+import carb
 from isaac_utils.utils import geom
 from isaac_utils.utils.path import world_path
 from isaacsim_msgs.msg import Scale
@@ -41,7 +42,11 @@ def edit_prims_callback(request: EditPrims.Request, response: EditPrims.Response
         results = (a and b for a, b in zip(results, map(scale_prim, (p.name for p in request.prims), (p.scale for p in request.prims))))
 
     response.ret = list(results)
-    return response
+    carb.log_warn(
+        f"[EditPrims] Edited {sum(1 for ok in response.ret if ok)}/{len(response.ret)} prim(s); "
+        "suppressing ROS response to avoid Isaac embedded rclpy response conversion abort"
+    )
+    raise RuntimeError('EditPrims response intentionally suppressed after edit')
 
 
 edit_prims_service = Service(

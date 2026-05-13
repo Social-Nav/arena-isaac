@@ -10,11 +10,27 @@ import arena_simulation_setup.utils.cattrs
 # Use the isaacsim to import SimulationApp
 from isaacsim import SimulationApp
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {'', '0', 'false', 'no', 'off'}:
+        return False
+    if normalized in {'1', 'true', 'yes', 'on'}:
+        return True
+    try:
+        return bool(int(normalized))
+    except ValueError:
+        return default
+
+
 # Setting the config for simulation and make an simulation.
 CONFIG = {
     #"renderer": "Wireframe",
-    "renderer": "RayTracedLighting",
-    "headless": False,
+    "renderer": os.environ.get("ARENA_ISAAC_RENDERER", "RayTracedLighting"),
+    "headless": _env_flag("ARENA_ISAAC_HEADLESS", False),
 }
 #import parent directory
 import sys
@@ -150,7 +166,14 @@ from isaac_utils.managers.door_manager import DoorManager
 from isaac_utils.managers.elevator_manager import elevator_manager
 
 #Import services
-from arena_isaac.services import services
+try:
+    from arena_isaac.services import services
+except ImportError as e:
+    import carb
+    import traceback
+    carb.log_error(f"Failed to import services: {e}\n{traceback.format_exc()}")
+    services = []
+
 from pedestrian.simulator.logic.people_manager import PeopleManager
 from rclpy.qos import QoSProfile
 from arena_isaac import run_after_tick_queue
@@ -305,7 +328,12 @@ class RaycastObstaclePublisher(rclpy.node.Node):
 class IsaacController(rclpy.node.Node):
     def __init__(self, *args, **kwargs):
         super().__init__(node_name="isaac", *args, **kwargs)
-        self._running = False
+        # Keep Isaac stepping by default in Docker eval runs.  The ROS image
+        # writers attached to render products only publish while the simulation
+        # is stepped with render=True; waiting for an external UnpauseSimulation
+        # request caused head/top-down camera topics to exist but never emit real
+        # Isaac-rendered frames.
+        self._running = True
         self._should_step_once = False
 
         self.__pause_srv = self.create_service(
@@ -600,7 +628,13 @@ def main(args=None):
     )
 
     PublishTime('/World/publish_time')
-    world.reset()
+    if _env_flag('ARENA_ISAAC_SKIP_WORLD_RESET', True):
+        controller.get_logger().warn(
+            'Skipping blocking Isaac World.reset() during Docker eval startup; '
+            'service callbacks will initialize spawned assets on demand.'
+        )
+    else:
+        world.reset()
 
     # Replicator
     #处理Ctrl+C 退出
@@ -628,22 +662,43 @@ def main(args=None):
     # signal.signal(signal.SIGTERM, emergency_save_handler)
     # signal.signal(signal.SIGHUP, emergency_save_handler)   # docker exec 断开时触发
     # set photoreal settings
-    import isaac_utils.config.photoreal as photoreal
-    if os.environ.get('RENDER_PRESET', 'photoreal') != 'boring':
-        photoreal.PRESET_PHOTOREAL.apply()
+    if _env_flag('ARENA_ISAAC_SKIP_PHOTOREAL', True):
+        controller.get_logger().warn(
+            'Skipping photoreal renderer preset during Docker eval startup; '
+            'this avoids blocking before ROS service callbacks are processed.'
+        )
     else:
-        photoreal.PRESET_DEFAULT.apply()
+        import isaac_utils.config.photoreal as photoreal
+        if os.environ.get('RENDER_PRESET', 'photoreal') != 'boring':
+            photoreal.PRESET_PHOTOREAL.apply()
+        else:
+            photoreal.PRESET_DEFAULT.apply()
 
     # hard reset once
     omni.timeline.get_timeline_interface().stop()
 
     # mainloop
     was_playing: bool = False
+    suppressed_service_response_markers = (
+        'response intentionally suppressed',
+    )
     try:
         while simulation_app.is_running():
             stepped_this_iteration: bool = False
-            rclpy.spin_once(controller, timeout_sec=0)
-            rclpy.spin_once(raycast_pub, timeout_sec=0)
+            try:
+                rclpy.spin_once(controller, timeout_sec=0)
+            except RuntimeError as e:
+                if any(marker in str(e) for marker in suppressed_service_response_markers):
+                    controller.get_logger().warn(str(e))
+                else:
+                    raise
+            try:
+                rclpy.spin_once(raycast_pub, timeout_sec=0)
+            except RuntimeError as e:
+                if any(marker in str(e) for marker in suppressed_service_response_markers):
+                    controller.get_logger().warn(str(e))
+                else:
+                    raise
             if controller.running:
                 if not was_playing:
                     world.play()

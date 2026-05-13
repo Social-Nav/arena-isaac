@@ -1,4 +1,5 @@
 import numpy as np
+import carb
 
 from isaac_utils.utils import geom, prim
 from isaac_utils.utils.path import world_path
@@ -25,7 +26,11 @@ def prim_importer(prim_msg: Prim) -> bool:
 
 def spawn_prims_callback(request: SpawnPrims.Request, response: SpawnPrims.Response):
     response.ret = list(map(prim_importer, request.prims))
-    return response
+    carb.log_warn(
+        f"[SpawnPrims] Spawned {sum(1 for ok in response.ret if ok)}/{len(response.ret)} prim(s); "
+        "suppressing ROS response to avoid Isaac embedded rclpy response conversion abort"
+    )
+    raise RuntimeError('SpawnPrims response intentionally suppressed after spawn setup')
 
 
 spawn_prims_service = Service(
