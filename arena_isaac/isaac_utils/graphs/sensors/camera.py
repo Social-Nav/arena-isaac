@@ -315,14 +315,20 @@ class SensorCameraRGBD(SensorCamera):
         rv = omni.syntheticdata.SyntheticData.convert_sensor_type_to_rendervar(
             sd.SensorType.DistanceToImagePlane.name
         )
-        writer = rep.writers.get(rv + "ROS2PublishImage")
-        writer.initialize(
-            frameId=frame,
-            nodeNamespace=node_namespace,
-            queueSize=queue_size,
-            topicName=os.path.join(camera_topic, 'depth')
-        )
-        writer.attach([render_product])
+        # Turtlebot eval historically consumes rgbd_camera/depth_image while
+        # several other robots and legacy Isaac helpers still look for
+        # */depth. Publish both aliases from the same render product so camera
+        # readiness, InternNav, and the eval recorder all observe real depth
+        # frames without requiring robot-specific topic rewrites.
+        for topic_suffix in ('depth', 'depth_image'):
+            writer = rep.writers.get(rv + "ROS2PublishImage")
+            writer.initialize(
+                frameId=frame,
+                nodeNamespace=node_namespace,
+                queueSize=queue_size,
+                topicName=os.path.join(camera_topic, topic_suffix)
+            )
+            writer.attach([render_product])
 
         gate_path = omni.syntheticdata.SyntheticData._get_node_path(
             rv + "IsaacSimulationGate", render_product
