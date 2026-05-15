@@ -33,6 +33,8 @@ def odom(
 
     on_playback_tick = graph.node('on_playback_tick', 'omni.graph.action.OnPlaybackTick')
     read_simulation_time = graph.node('read_simulation_time', 'isaacsim.core.nodes.IsaacReadSimulationTime')
+    get_chassis_prim = graph.node('get_chassis_prim', 'omni.replicator.core.OgnGetPrimAtPath')
+    compute_odometry = graph.node('compute_odometry', 'isaacsim.core.nodes.IsaacComputeOdometry')
     get_transform = graph.node('get_transform', 'omni.graph.nodes.GetPrimLocalToWorldTransform')
     extract_translation = graph.node('extract_translation', 'omni.graph.nodes.GetMatrix4Translation')
     extract_rotation = graph.node('extract_rotation', 'omni.graph.nodes.GetMatrix4Quaternion')
@@ -41,8 +43,13 @@ def odom(
 
     on_playback_tick.connect('tick', publish_odom, 'execIn')
     on_playback_tick.connect('tick', publish_map, 'execIn')
+    on_playback_tick.connect('tick', get_chassis_prim, 'execIn')
+    on_playback_tick.connect('tick', compute_odometry, 'execIn')
     read_simulation_time.connect('simulationTime', publish_odom, 'timeStamp')
     read_simulation_time.connect('simulationTime', publish_map, 'timeStamp')
+
+    get_chassis_prim.attribute('paths', [prim_path])
+    get_chassis_prim.connect('prims', compute_odometry, 'chassisPrim')
 
     get_transform.attribute('primPath', prim_path)
     get_transform.connect('localToWorldTransform', extract_translation, 'matrix')
@@ -67,6 +74,8 @@ def odom(
         publish_odom_topic.attribute('chassisFrameId', base_frame_id)
         extract_translation.connect('translation', publish_odom_topic, 'position')
         extract_rotation.connect('quaternion', publish_odom_topic, 'orientation')
+        compute_odometry.connect('linearVelocity', publish_odom_topic, 'linearVelocity')
+        compute_odometry.connect('angularVelocity', publish_odom_topic, 'angularVelocity')
 
     graph.load_extensions()
     return graph.execute(controller)
