@@ -922,15 +922,32 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
 
         _disable_odom_graph_tf(prim_path)
 
-        if not odom.odom(
-            os.path.join(prim_path, 'odom_publisher'),
-            prim_path=odom_prim_path,
-            base_frame_id=fq_base_frame,
-            odom_frame_id=fq_odom_frame,
-            map_frame_id=fq_world_frame,
-            odom_topic=odom_topic,
-        ):
-            carb.log_error('[SpawnUsdRobot] Failed to create odom graph')
+        # Arena's task_generator installs a synthetic fallback odom/TF publisher
+        # for USD robots before this service is called.  Creating a second Isaac
+        # odom graph on the same namespaced /odom topic is harmful when the USD
+        # articulation/controller graph is present but not actually responding
+        # to cmd_vel: Nav2 and the data recorder then receive alternating
+        # stationary Isaac odom and moving fallback odom samples.  Keep the
+        # explicit fallback as the single odom source unless a developer opts
+        # into the Isaac graph for controller debugging.
+        enable_isaac_odom_graph = str(
+            os.environ.get('ARENA_SPAWN_USD_ROBOT_ENABLE_ISAAC_ODOM_GRAPH', '')
+        ).strip().lower() in {'1', 'true', 'yes', 'on'}
+        if enable_isaac_odom_graph:
+            if not odom.odom(
+                os.path.join(prim_path, 'odom_publisher'),
+                prim_path=odom_prim_path,
+                base_frame_id=fq_base_frame,
+                odom_frame_id=fq_odom_frame,
+                map_frame_id=fq_world_frame,
+                odom_topic=odom_topic,
+            ):
+                carb.log_error('[SpawnUsdRobot] Failed to create odom graph')
+        else:
+            carb.log_warn(
+                '[SpawnUsdRobot] Skipping Isaac USD odom graph; using Arena '
+                f'task-generator fallback odom/TF on {odom_topic}'
+            )
 
     except Exception as e:
         carb.log_error(f"[SpawnUsdRobot] Graph setup failed: {e}\n{traceback.format_exc()}")
