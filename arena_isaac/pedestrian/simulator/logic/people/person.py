@@ -12,7 +12,7 @@ from isaac_utils.utils.assets import get_assets_root_path_safe
 from omni.anim.people import PeopleSettings
 from isaacsim.core.utils import prims
 from omni.usd import get_stage_next_free_path
-from pxr import Gf, Sdf
+from pxr import Gf, Sdf, UsdGeom
 from scipy.spatial.transform import Rotation
 
 from pedestrian.simulator.logic.people.person_controller import PersonController
@@ -243,6 +243,15 @@ class Person:
         self._state.position = np.array([pos[0], pos[1], pos[2]])
         self._state.orientation = np.array([rot.x, rot.y, rot.z, rot.w])
 
+        # Sync the lidar proxy cylinder to the character's current world pose.
+        # Lift z by ~0.875m so the cylinder bottom sits on the ground.
+        if getattr(self, "_proxy_prim", None) is not None:
+            try:
+                xform = UsdGeom.XformCommonAPI(self._proxy_prim)
+                xform.SetTranslate(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2]) + 0.875))
+            except Exception:
+                pass
+
         # Signal the controller the updated state
         if self._controller:
             self._controller.update_state(self._state)
@@ -278,6 +287,29 @@ class Person:
 
         # Add the current person to the person manager
         PeopleManager.get_people_manager().add_person(self._stage_prefix, self)
+
+        # Add a lidar-only proxy: a fully transparent cylinder that the RTX lidar still
+        # raytraces against, inflating the pedestrian's footprint in the costmap so the
+        # planner avoids them more reliably. No physics — purely a perception aid.
+        self._proxy_path = self._stage_prefix + "_lidar_proxy"
+        self._setup_lidar_proxy(init_pos)
+
+    def _setup_lidar_proxy(self, init_pos):
+        """Create an invisible cylinder as a sibling to the character root.
+        Cylinder axis = Z, radius 0.5m, height 1.75m. Set visibility="invisible"
+        so the camera/Hydra renderers skip it, but Isaac's RTX lidar raytracer
+        still hits the geometry — inflating the pedestrian footprint in the costmap.
+        No physics, no material — purely a perception aid.
+        """
+        cyl = UsdGeom.Cylinder.Define(self._current_stage, self._proxy_path)
+        cyl.CreateAxisAttr("Z")
+        cyl.CreateRadiusAttr(0.5)
+        cyl.CreateHeightAttr(1.75)
+        UsdGeom.XformCommonAPI(cyl).SetTranslate(
+            Gf.Vec3d(float(init_pos[0]), float(init_pos[1]), float(init_pos[2]) + 0.875)
+        )
+        UsdGeom.Imageable(cyl).MakeInvisible()
+        self._proxy_prim = cyl.GetPrim()
 
     def add_animation_graph_to_agent(self):
 
@@ -399,6 +431,12 @@ class Person:
             prims.delete_prim(self._stage_prefix)
         except Exception as e:
             carb.log_warn(f"Exception while deleting prim '{self._stage_prefix}': {e}")
+        # Delete the lidar proxy cylinder too
+        try:
+            if self._current_stage.GetPrimAtPath(self._proxy_path):
+                prims.delete_prim(self._proxy_path)
+        except Exception as e:
+            carb.log_warn(f"Exception while deleting lidar proxy '{self._proxy_path}': {e}")
         # NOTE: do NOT call PeopleManager.remove_person() here;
         # remove_person() already called destroy() to get here, calling back
         # would be an infinite recursion and uses the wrong key anyway.

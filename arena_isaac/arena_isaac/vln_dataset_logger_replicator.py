@@ -556,8 +556,10 @@ class VLNDataLoggerReplicator:
         for i, xform_prim in enumerate(self.pedestrian_prims):
             label = f"p_{i+1}"
             
-            # Get pose
-            position, orientation = xform_prim.get_world_pose()
+            # Get pose (new XformPrim batched API: get_world_poses returns wp.array)
+            positions, orientations = xform_prim.get_world_poses()
+            position = np.asarray(positions.numpy()[0])
+            orientation = np.asarray(orientations.numpy()[0])
             
             # Quaternion [x, y, z, w] to rotation matrix
             r = R.from_quat([orientation[1], orientation[2], orientation[3], orientation[0]])

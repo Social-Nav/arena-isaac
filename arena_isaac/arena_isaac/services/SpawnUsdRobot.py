@@ -32,6 +32,69 @@ TF_DETECT_KEYWORDS = {'parentframeid', 'childframeid'}
 NAMESPACE_KEYWORDS = {'nodenamespace'}
 
 
+def _override_lidar_attrs(
+    prim_path: str,
+    near_range_m: float = 0.8,
+    scan_rate_hz: int = 30,
+) -> int:
+    """Override perception-relevant attributes on every OmniLidar prim under
+    `prim_path`:
+      - `nearRangeM`: skip the profile's default 1.0m blind zone so close-range
+        hits (e.g. pedestrians next to the robot) are not culled.
+      - `scanRateBaseHz`: raise scan rate to reduce dropouts and feed costmap
+        faster. `reportRateBaseHz` is scaled proportionally so per-scan sample
+        count stays the same (avoids rewriting the per-channel ray tables).
+
+    Returns the number of lidar prims updated.
+    """
+    stage = omni.usd.get_context().get_stage()
+    root_prim = stage.GetPrimAtPath(prim_path)
+    if not root_prim or not root_prim.IsValid():
+        return 0
+
+    def _set(prim, name, type_name, value):
+        attr = prim.GetAttribute(name)
+        if not attr or not attr.IsValid():
+            attr = prim.CreateAttribute(name, type_name, custom=False)
+        attr.Set(value)
+
+    updated = 0
+    for prim in Usd.PrimRange(root_prim):
+        if prim.GetTypeName() != "OmniLidar":
+            continue
+        try:
+            _set(prim, "omni:sensor:Core:nearRangeM",
+                 Sdf.ValueTypeNames.Float, float(near_range_m))
+
+            # Read current scanRate to compute proportional reportRate scale-up
+            cur_scan_attr = prim.GetAttribute("omni:sensor:Core:scanRateBaseHz")
+            cur_report_attr = prim.GetAttribute("omni:sensor:Core:reportRateBaseHz")
+            cur_scan = int(cur_scan_attr.Get()) if (cur_scan_attr and cur_scan_attr.Get() is not None) else 10
+            cur_report = int(cur_report_attr.Get()) if (cur_report_attr and cur_report_attr.Get() is not None) else cur_scan * 360
+
+            samples_per_scan = max(1, int(round(cur_report / max(1, cur_scan))))
+            new_report = int(scan_rate_hz) * samples_per_scan
+
+            _set(prim, "omni:sensor:Core:scanRateBaseHz",
+                 Sdf.ValueTypeNames.UInt, int(scan_rate_hz))
+            _set(prim, "omni:sensor:Core:reportRateBaseHz",
+                 Sdf.ValueTypeNames.UInt, int(new_report))
+
+            carb.log_warn(
+                f"[SpawnUsdRobot] Lidar override on {prim.GetPath()}: "
+                f"nearRangeM={near_range_m}, "
+                f"scanRateBaseHz {cur_scan}->{scan_rate_hz}, "
+                f"reportRateBaseHz {cur_report}->{new_report} "
+                f"({samples_per_scan} samples/scan)"
+            )
+            updated += 1
+        except Exception as e:
+            carb.log_warn(
+                f"[SpawnUsdRobot] Failed to override lidar attrs on {prim.GetPath()}: {e}"
+            )
+    return updated
+
+
 def _find_articulation_root(prim_path: str) -> str | None:
     """Return the path of the prim that carries both ArticulationRootAPI and
     RigidBodyAPI — the PhysX articulation root body (e.g. base_link).
@@ -425,6 +488,12 @@ def spawn_usd_robot(request: SpawnUsdRobot.Request) -> str:
         carb.log_warn("[SpawnUsdRobot] Triggered app.update() for OmniGraph init")
     except Exception as e:
         carb.log_error(f"[SpawnUsdRobot] app.update() failed: {e}")
+
+    try:
+        n = _override_lidar_attrs(prim_path, near_range_m=0.8, scan_rate_hz=10)
+        carb.log_warn(f"[SpawnUsdRobot] Lidar attribute override applied to {n} sensor(s)")
+    except Exception as e:
+        carb.log_warn(f"[SpawnUsdRobot] Lidar attribute override failed: {e}")
 
     articulation_prim_path = _find_articulation_root(prim_path)
     if articulation_prim_path is None:
