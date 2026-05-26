@@ -14,4 +14,4 @@ IsaacLab
 *.gv
 *.pdf
 test.py
-checkpoint.py
+checkpoint.pyarena_isaac/output/
