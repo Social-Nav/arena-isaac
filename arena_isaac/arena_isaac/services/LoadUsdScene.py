@@ -90,5 +90,17 @@ load_usd_scene_service = Service(
     callback=load_usd_scene,
 )
 
+# Legacy _srv variant for FastDDS compatibility.
+# The canonical /isaac/LoadUsdScene appears in graph queries but rclpy
+# clients in the arena container sometimes cannot connect (call_async
+# request never reaches the server).  The _srv variant uses a different
+# participant endpoint that reliably works with FastDDS cross-container
+# discovery.  See SpawnUsdRobot_srv for the same pattern.
+load_usd_scene_srv_service = Service(
+    srv_type=LoadUsdScene,
+    srv_name='isaac/LoadUsdScene_srv',
+    callback=load_usd_scene,
+)
 
-__all__ = ['load_usd_scene_service']
+
+__all__ = ['load_usd_scene_service', 'load_usd_scene_srv_service']

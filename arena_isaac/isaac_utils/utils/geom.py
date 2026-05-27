@@ -7,77 +7,15 @@ import attrs
 import carb
 import geometry_msgs.msg
 import numpy as np
-import omni.timeline
 from isaacsim.core.experimental.prims import Prim, RigidPrim, XformPrim, Articulation
 from isaacsim.core.utils.rotations import euler_angles_to_quat, quat_to_euler_angles
 from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 import isaacsim_msgs.msg
-from arena_isaac import run_after_tick_queue
 
 
 _robot_articulation_registry: dict[str, str] = {}
 _robot_articulation_registry_lock = threading.RLock()
-
-
-def _timeline_is_playing() -> bool:
-    try:
-        return bool(omni.timeline.get_timeline_interface().is_playing())
-    except Exception:
-        return False
-
-
-def _apply_articulation_teleport(
-    art_path: str,
-    pos_arr: np.ndarray | None,
-    rot_arr: np.ndarray | None,
-) -> bool:
-    art = Articulation(art_path)
-    art.set_world_poses(pos_arr, rot_arr)
-    try:
-        art.set_linear_velocities(np.zeros((1, 3)))
-        art.set_angular_velocities(np.zeros((1, 3)))
-    except Exception:
-        pass
-    try:
-        joint_vels = art.get_joint_velocities()
-        if joint_vels is not None:
-            art.set_joint_velocities(np.zeros_like(joint_vels))
-    except Exception:
-        pass
-    return True
-
-
-def _queue_articulation_teleport(
-    art_path: str,
-    pos_arr: np.ndarray | None,
-    rot_arr: np.ndarray | None,
-    *,
-    attempt: int = 1,
-):
-    def _deferred() -> None:
-        if not _timeline_is_playing():
-            carb.log_warn(
-                f"[geom.move] deferred articulation teleport waiting for play: art={art_path}, attempt={attempt}"
-            )
-            if attempt < 10:
-                _queue_articulation_teleport(art_path, pos_arr, rot_arr, attempt=attempt + 1)
-            return
-
-        try:
-            _apply_articulation_teleport(art_path, pos_arr, rot_arr)
-            carb.log_warn(
-                f"[geom.move] deferred articulation teleport applied: art={art_path}, attempt={attempt}"
-            )
-        except Exception as e:
-            carb.log_warn(
-                f"[geom.move] deferred Articulation({art_path}).set_world_poses failed on attempt {attempt}: {e}"
-            )
-            if attempt < 10:
-                _queue_articulation_teleport(art_path, pos_arr, rot_arr, attempt=attempt + 1)
-
-    run_after_tick_queue.put_nowait(_deferred)
-
 
 def _normalize_prim_path(prim_path: str | typing.Sequence[str]) -> str:
     while isinstance(prim_path, (list, tuple)):
@@ -344,15 +282,22 @@ def _teleport_articulation(
             carb.log_warn(f"[geom.move] container Xform move failed: {e}")
 
     # Step 2: teleport the PhysX articulation (required for correct reset position).
-    # Always defer this to a post-step callback instead of touching Articulation()
-    # inline. During spawn/reset the stage can already be "playing" while the
-    # articulation tensor/simulation view is still not initialized; constructing
-    # Articulation() in that window poisons the cached view and triggers endless
-    # "Simulation view object is invalidated" errors on subsequent ticks.
-    carb.log_warn(
-        f"[geom.move] queued articulation teleport for post-step apply: art={art_path}"
-    )
-    _queue_articulation_teleport(art_path, pos_arr, rot_arr)
+    try:
+        art = Articulation(art_path)
+        art.set_world_poses(pos_arr, rot_arr)
+        try:
+            art.set_linear_velocities(np.zeros((1, 3)))
+            art.set_angular_velocities(np.zeros((1, 3)))
+        except Exception:
+            pass
+        try:
+            joint_vels = art.get_joint_velocities()
+            if joint_vels is not None:
+                art.set_joint_velocities(np.zeros_like(joint_vels))
+        except Exception:
+            pass
+    except Exception as e:
+        carb.log_warn(f"[geom.move] Articulation({art_path}).set_world_poses FAILED: {e}")
 
 
 def move(
@@ -361,7 +306,6 @@ def move(
     translation: Translation | None = None,
     rotation: Rotation | None = None,
     local: bool = False,
-    physics_teleport: bool = True,
 ):
     container_path = prim_path          # top-level robot Xform before registry resolve
     prim_path = _resolve_robot(prim_path)
@@ -371,25 +315,8 @@ def move(
         carb.log_warn(f"[geom.move] prim not valid: {prim_path}")
         return
 
-    is_articulation = all(p.HasAPI(UsdPhysics.ArticulationRootAPI) for p in prim.prims)
-
-    if (not physics_teleport) and (not local) and is_articulation:
-        xform_target_path = container_path if container_path != prim_path else prim_path
-        carb.log_warn(
-            f"[geom.move] using Xform-only articulation placement: art={prim_path}, target={xform_target_path}"
-        )
-        XformPrim(xform_target_path).set_world_poses(
-            np.array(np.atleast_2d(translation.tuple())) if translation is not None else None,
-            np.array(np.atleast_2d(rotation.quat())) if rotation is not None else None,
-        )
-        return
-
-    # Articulation (world-space): use direct PhysX interface on root body unless
-    # the caller explicitly requests a USD/Xform-only move. Spawn-time robot
-    # placement must avoid touching Articulation() before PhysX has finished
-    # initializing the robot, otherwise Isaac can cache an invalid simulation
-    # view and spam tensor-plugin errors forever.
-    if physics_teleport and (not local) and is_articulation:
+    # Articulation (world-space): use direct PhysX interface on root body.
+    if (not local) and all(p.HasAPI(UsdPhysics.ArticulationRootAPI) for p in prim.prims):
         _teleport_articulation(prim_path, container_path, translation, rotation)
         return
 

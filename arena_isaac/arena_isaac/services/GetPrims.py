@@ -36,7 +36,10 @@ def get_prim(name: str) -> Prim:
 
 
 def get_prims_callback(request: GetPrims.Request, response: GetPrims.Response):
-    response.prims = list(filter(None, map(get_prim, request.prim_paths)))
+    names = list(getattr(request, 'names', []) or [])
+    if not names:
+        names = list(getattr(request, 'prim_paths', []) or [])
+    response.prims = list(filter(None, map(get_prim, names)))
     return response
 
 

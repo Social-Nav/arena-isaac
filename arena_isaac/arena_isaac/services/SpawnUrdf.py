@@ -133,6 +133,7 @@ def spawn_urdf(request: SpawnUrdf.Request) -> str:
             odom_topic=request.odom_topic,
         ):
             carb.log_error("Failed to create odom graph")
+            return ''
 
     if not tf.tf(
         os.path.join(prim_path, 'tf_publisher'),
@@ -140,6 +141,7 @@ def spawn_urdf(request: SpawnUrdf.Request) -> str:
         tf_prefix=request.tf_prefix,
     ):
         carb.log_error("Failed to create tf graph")
+        return ''
 
     if request.joint_states_topic:
         if not joint_states.joint_states(
@@ -148,6 +150,7 @@ def spawn_urdf(request: SpawnUrdf.Request) -> str:
             joint_states_topic=request.joint_states_topic,
         ):
             carb.log_error("Failed to create joint_states graph")
+            return ''
 
     if request.cmd_vel_topic:
         if not control.Control(
@@ -158,6 +161,7 @@ def spawn_urdf(request: SpawnUrdf.Request) -> str:
             robot_model=robot_model,
         ):
             carb.log_error("Failed to create control graph")
+            return ''
 
     with open(request.urdf_path, 'r') as f:
         sensors.Sensors(
@@ -171,13 +175,10 @@ def spawn_urdf(request: SpawnUrdf.Request) -> str:
         articulation_prim_path=os.path.join(prim_path, request.base_frame),
     )
 
-    # Place the imported articulation at the requested spawn pose immediately so
-    # the first reset/odom sample already reflects the episode start location.
     geom.move(
         prim_path=prim_path,
         translation=geom.Translation.parse(request.pose.position),
         rotation=geom.Rotation.parse(request.pose.orientation),
-        physics_teleport=True,
     )
 
     DoorManager.instance().add_robot(prim_path, request.odom_topic)

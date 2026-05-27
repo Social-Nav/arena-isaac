@@ -12,10 +12,14 @@ Usage:
     loader.add_colliders("/World/Scene")
 """
 
+import os
+import time
+
 import carb
 from pathlib import Path
 from pxr import Usd, UsdGeom, UsdPhysics, Gf, Sdf
 import omni.usd
+import omni.kit.app
 
 try:
     from isaacsim.core.utils import prims
@@ -65,6 +69,13 @@ class USDSceneLoader:
 
         disable_cooking = load_config.get('disable_collision_cooking', True)
         auto_colliders = load_config.get('add_colliders_automatically', True)
+        post_reference_updates = int(
+            load_config.get(
+                'post_reference_updates',
+                os.environ.get('ARENA_ISAAC_POST_REFERENCE_UPDATES', '1'),
+            )
+            or 0
+        )
 
         try:
             usd_file_path = Path(usd_path)
@@ -111,6 +122,14 @@ class USDSceneLoader:
                 f"pos={list(_pos)}"
             )
 
+            # GRScenes-style USDs often defer the expensive composition / asset
+            # realization work until the next Kit updates. If we return from the
+            # ROS LoadUsdScene service immediately, that hidden cost is paid later
+            # by unrelated Pause/Unpause or clock-dependent bringup steps, making
+            # those services appear hung. Force a few synchronous Kit updates here
+            # so the long scene-load latency is charged to LoadUsdScene itself.
+            self._warm_stage_after_reference(scene_prim_path, post_reference_updates)
+
             if auto_colliders:
                 self.add_colliders(scene_prim_path)
 
@@ -129,6 +148,37 @@ class USDSceneLoader:
             import traceback
             carb.log_error(traceback.format_exc())
             return False
+
+    def _warm_stage_after_reference(self, scene_prim_path: str, updates: int) -> None:
+        if updates <= 0:
+            return
+
+        app = omni.kit.app.get_app()
+        stage = omni.usd.get_context().get_stage()
+
+        for update_idx in range(1, updates + 1):
+            started = time.monotonic()
+            app.update()
+            elapsed = time.monotonic() - started
+
+            child_count = -1
+            total_prims = -1
+            try:
+                if stage is None:
+                    stage = omni.usd.get_context().get_stage()
+                scene_prim = stage.GetPrimAtPath(scene_prim_path) if stage else None
+                if scene_prim and scene_prim.IsValid():
+                    child_count = len(list(scene_prim.GetChildren()))
+                if stage:
+                    total_prims = sum(1 for _ in stage.Traverse())
+            except Exception as exc:
+                carb.log_warn(f"[USDSceneLoader] Failed to inspect stage after update {update_idx}: {exc}")
+
+            level_fn = carb.log_warn if elapsed >= 5.0 else carb.log_info
+            level_fn(
+                f"[USDSceneLoader] post-reference update {update_idx}/{updates} took {elapsed:.3f}s "
+                f"(children={child_count}, total_prims={total_prims})"
+            )
 
     def _disable_collision_cooking(self):
         """Disable UJITSO collision cooking for faster loading."""

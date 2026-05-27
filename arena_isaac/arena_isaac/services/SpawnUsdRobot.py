@@ -1,3 +1,4 @@
+import math
 import os
 import traceback
 
@@ -58,15 +59,15 @@ NAMESPACE_KEYWORDS = {'nodenamespace'}
 
 
 def _find_articulation_root(prim_path: str) -> str | None:
-    """Return the PhysX articulation root body for a spawned robot.
+    """Return the first PhysX articulation root body for a spawned robot.
 
-    Some third-party USD robots are authored with more than one prim carrying
-    ArticulationRootAPI.  Ai2_Bot2 is one such asset: the real full-body root is
-    ``base_link`` while the nested chassis ``base_footprint`` also has
-    ArticulationRootAPI.  Returning the first traversal hit can target only the
-    nested chassis and make reset/controller commands fight PhysX's active
-    articulation.  Prefer an explicit ``base_link`` root when present, then fall
-    back to the first valid root for other robots.
+    Do not second-guess the composed USD traversal order here.  Ai2_Bot2 carries
+    duplicate ArticulationRootAPI schemas on the chassis ``base_footprint`` and
+    upper-body ``base_link``.  The older, known-good Arena/Isaac runs kept the
+    first valid root, which is the chassis root.  Forcing ``base_link`` and
+    removing the chassis root changes PhysX's active articulation semantics and
+    can make the robot sink during initialization even though the same USD stays
+    stable with the original root selection.
 
     Returns None if no such prim exists under prim_path.
     """
@@ -75,29 +76,11 @@ def _find_articulation_root(prim_path: str) -> str | None:
     if not root_prim.IsValid():
         return None
 
-    candidates: list[str] = []
     for prim in Usd.PrimRange(root_prim):
         if prim.HasAPI(UsdPhysics.ArticulationRootAPI) and prim.HasAPI(UsdPhysics.RigidBodyAPI):
-            candidates.append(str(prim.GetPath()))
+            return str(prim.GetPath())
 
-    if not candidates:
-        return None
-
-    for candidate in candidates:
-        if os.path.basename(candidate) == 'base_link':
-            if len(candidates) > 1:
-                carb.log_warn(
-                    f"[SpawnUsdRobot] Multiple articulation roots under {prim_path}: {candidates}; "
-                    f"preferring full-body root {candidate}"
-                )
-            return candidate
-
-    if len(candidates) > 1:
-        carb.log_warn(
-            f"[SpawnUsdRobot] Multiple articulation roots under {prim_path}: {candidates}; "
-            f"falling back to first traversal candidate {candidates[0]}"
-        )
-    return candidates[0]
+    return None
 
 
 def _remove_extra_articulation_roots(prim_path: str, preferred_root_path: str) -> int:
@@ -692,7 +675,11 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
     xform = UsdGeom.Xformable(camera.GetPrim())
     xform.ClearXformOpOrder()
     xform.AddTranslateOp().Set(Gf.Vec3d(float(request_pose.position.x), float(request_pose.position.y), 8.0))
-    xform.AddOrientOp().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    # Keep the standalone sim_top_down camera in a true nadir view.
+    # Identity orientation points the Isaac/USD camera horizontally here, which
+    # produced the observed grey wall/corner frames instead of a top-down scene.
+    top_down_rotation = geom.Rotation.parse([0.0, -math.pi / 2.0, 0.0])
+    xform.AddOrientOp().Set(Gf.Quatf(top_down_rotation.w, top_down_rotation.x, top_down_rotation.y, top_down_rotation.z))
     carb.log_warn(
         f"[SpawnUsdRobot] Created top-down camera {top_down_camera_path} "
         f"at ({float(request_pose.position.x):.3f}, {float(request_pose.position.y):.3f}, 8.000)"
@@ -700,10 +687,10 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
     return top_down_camera_path
 
 
-def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str | None, request_pose) -> None:
+def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str | None, request_pose) -> bool:
     if rep is None or sd is None or read_camera_info is None:
         carb.log_error('[SpawnUsdRobot] Cannot publish VLN cameras: Replicator/ROS2 bridge camera APIs unavailable')
-        return
+        return False
 
     frame_namespace = namespace.split('/')[-1] if namespace else ''
     base_frame_id = base_frame or BASE_FRAME_DEFAULT
@@ -714,6 +701,7 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
     head_camera_path = _find_named_camera_prim(prim_path, 'head_camera')
     if head_camera_path is None:
         carb.log_error(f'[SpawnUsdRobot] No Camera prim found under {prim_path}; head_camera ROS publishers not created')
+        return False
     else:
         try:
             head_rp = rep.create.render_product(head_camera_path, (640, 480))
@@ -723,6 +711,7 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
             carb.log_warn(f'[SpawnUsdRobot] Publishing head camera {head_camera_path} on /{namespace}/head_camera/*')
         except Exception as e:
             carb.log_error(f'[SpawnUsdRobot] Failed to create head_camera ROS publishers: {e}\n{traceback.format_exc()}')
+            return False
 
     try:
         top_down_path = _ensure_top_down_camera(prim_path, request_pose, namespace)
@@ -732,6 +721,9 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
         carb.log_warn(f'[SpawnUsdRobot] Publishing top-down camera {top_down_path} on /{namespace}/top_down_camera/*')
     except Exception as e:
         carb.log_error(f'[SpawnUsdRobot] Failed to create top_down_camera ROS publishers: {e}\n{traceback.format_exc()}')
+        return False
+
+    return True
 
 
 def _remap_namespace(prim_path: str, namespace: str, base_frame: str | None = None):
@@ -845,12 +837,6 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
 
     usd_name = os.path.splitext(os.path.basename(usd_path))[0]
     is_ai2_bot2 = name == 'Ai2_Bot2' or usd_name == 'Ai2_Bot2' or 'Ai2_Bot2' in usd_path
-    if is_ai2_bot2:
-        # Clean duplicate roots before the first Kit update gives PhysX a
-        # chance to instantiate a split articulation.
-        pre_update_root = _find_articulation_root(prim_path)
-        if pre_update_root:
-            _remove_extra_articulation_roots(prim_path, pre_update_root)
 
     try:
         import omni.kit.app
@@ -869,16 +855,16 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
     carb.log_warn(f"[SpawnUsdRobot] Articulation root at: {articulation_prim_path}")
 
     try:
-        if is_ai2_bot2:
-            removed_roots = _remove_extra_articulation_roots(prim_path, articulation_prim_path)
-            if removed_roots:
-                try:
-                    import omni.kit.app
-                    omni.kit.app.get_app().update()
-                except Exception:
-                    pass
+        removed_roots = _remove_extra_articulation_roots(prim_path, articulation_prim_path)
+        if removed_roots:
+            carb.log_warn(
+                f"[SpawnUsdRobot] Removed {removed_roots} duplicate articulation root(s) under {prim_path}"
+            )
     except Exception as e:
-        carb.log_warn(f"[SpawnUsdRobot] Duplicate articulation-root cleanup failed: {e}")
+        carb.log_error(
+            f"[SpawnUsdRobot] Duplicate articulation-root cleanup failed: {e}\n{traceback.format_exc()}"
+        )
+        return ''
 
     try:
         _remap_namespace(prim_path, namespace, base_frame=base_frame)
@@ -902,9 +888,16 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
         carb.log_error(f"[SpawnUsdRobot] Ai2_Bot2 control graph setup failed: {e}\n{traceback.format_exc()}")
 
     try:
-        _setup_vln_camera_publishers(prim_path, namespace, base_frame, request.pose)
+        require_vln_cameras = str(
+            os.environ.get('ARENA_SPAWN_USD_ROBOT_REQUIRE_VLN_CAMERAS', '1')
+        ).strip().lower() not in {'0', 'false', 'no', 'off'}
+        camera_publishers_ready = _setup_vln_camera_publishers(prim_path, namespace, base_frame, request.pose)
+        if require_vln_cameras and not camera_publishers_ready:
+            carb.log_error('[SpawnUsdRobot] Required VLN camera publishers were not created; spawn aborted.')
+            return ''
     except Exception as e:
         carb.log_error(f"[SpawnUsdRobot] VLN camera publisher setup failed: {e}\n{traceback.format_exc()}")
+        return ''
 
     try:
         base_frame_id = base_frame or BASE_FRAME_DEFAULT
@@ -916,23 +909,31 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
         stage = omni.usd.get_context().get_stage()
         base_prim_path = os.path.join(prim_path, base_frame_id)
         base_prim = stage.GetPrimAtPath(base_prim_path)
-        odom_prim_path = base_prim_path if base_prim and base_prim.IsValid() else articulation_prim_path
+        # Keep the odom graph tied to the same live articulation body that the
+        # diff-drive controller targets.  For Ai2_Bot2 and similar USDs the
+        # configured external base frame (usually ``base_link``) can be a
+        # different prim than the active articulation root
+        # (for example ``.../Ai2_Bot2_Chassis/base_footprint``).  Publishing
+        # odom/TF from the non-root prim makes the readiness chain observe a
+        # detached upper-body transform instead of the actual chassis physics
+        # state.
+        odom_prim_path = articulation_prim_path
+        if base_prim and base_prim.IsValid() and base_prim_path != articulation_prim_path:
+            carb.log_warn(
+                f"[SpawnUsdRobot] Using articulation root {articulation_prim_path} as odom source "
+                f"instead of configured base prim {base_prim_path}; child frame remains {fq_base_frame}"
+            )
 
         odom_topic = f"/{namespace.lstrip('/')}/odom" if namespace else "/odom"
 
         _disable_odom_graph_tf(prim_path)
 
-        # Arena's task_generator installs a synthetic fallback odom/TF publisher
-        # for USD robots before this service is called.  Creating a second Isaac
-        # odom graph on the same namespaced /odom topic is harmful when the USD
-        # articulation/controller graph is present but not actually responding
-        # to cmd_vel: Nav2 and the data recorder then receive alternating
-        # stationary Isaac odom and moving fallback odom samples.  Keep the
-        # explicit fallback as the single odom source unless a developer opts
-        # into the Isaac graph for controller debugging.
+        # Strict eval mode must wait for real Isaac odom/TF; do not rely on
+        # synthetic fallback publishers.  Allow opting out only for targeted
+        # graph-debug runs.
         enable_isaac_odom_graph = str(
-            os.environ.get('ARENA_SPAWN_USD_ROBOT_ENABLE_ISAAC_ODOM_GRAPH', '')
-        ).strip().lower() in {'1', 'true', 'yes', 'on'}
+            os.environ.get('ARENA_SPAWN_USD_ROBOT_ENABLE_ISAAC_ODOM_GRAPH', '1')
+        ).strip().lower() not in {'0', 'false', 'no', 'off'}
         if enable_isaac_odom_graph:
             if not odom.odom(
                 os.path.join(prim_path, 'odom_publisher'),
@@ -943,14 +944,16 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
                 odom_topic=odom_topic,
             ):
                 carb.log_error('[SpawnUsdRobot] Failed to create odom graph')
+                return ''
         else:
             carb.log_warn(
-                '[SpawnUsdRobot] Skipping Isaac USD odom graph; using Arena '
-                f'task-generator fallback odom/TF on {odom_topic}'
+                '[SpawnUsdRobot] Skipping Isaac USD odom graph because '
+                f'ARENA_SPAWN_USD_ROBOT_ENABLE_ISAAC_ODOM_GRAPH disabled it for {odom_topic}'
             )
 
     except Exception as e:
         carb.log_error(f"[SpawnUsdRobot] Graph setup failed: {e}\n{traceback.format_exc()}")
+        return ''
 
     geom.register_robot(
         robot_prim_path=prim_path,
@@ -961,10 +964,6 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
         prim_path=prim_path,
         translation=geom.Translation.parse(request.pose.position),
         rotation=geom.Rotation.parse(request.pose.orientation),
-        # During spawn PhysX may not have finalized the articulation view yet.
-        # Place the top-level Xform only; task resets use EditPrims with a
-        # physics teleport after initialization has settled.
-        physics_teleport=False,
     )
 
     odom_topic = f"/{namespace.lstrip('/')}/odom" if namespace else "/odom"

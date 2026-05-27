@@ -328,11 +328,6 @@ class RaycastObstaclePublisher(rclpy.node.Node):
 class IsaacController(rclpy.node.Node):
     def __init__(self, *args, **kwargs):
         super().__init__(node_name="isaac", *args, **kwargs)
-        # Keep Isaac stepping by default in Docker eval runs.  The ROS image
-        # writers attached to render products only publish while the simulation
-        # is stepped with render=True; waiting for an external UnpauseSimulation
-        # request caused head/top-down camera topics to exist but never emit real
-        # Isaac-rendered frames.
         self._running = True
         self._should_step_once = False
 
@@ -513,8 +508,10 @@ def main(args=None):
     sim = SimulationContext()
 
     IsaacController.wait_for_bridge()
+    sys.stderr.write("[ISAAC_DEBUG] Bridge ready, initializing rclpy...\n"); sys.stderr.flush()
     rclpy.init()
     controller = IsaacController()
+    sys.stderr.write("[ISAAC_DEBUG] Controller created.\n"); sys.stderr.flush()
 
     # Subscribe to task lifecycle events to control when data collection happens
     def _on_task_reset(msg: std_msgs.msg.Int16):
@@ -628,13 +625,21 @@ def main(args=None):
     )
 
     PublishTime('/World/publish_time')
+    sys.stderr.write("[ISAAC_DEBUG] About to world.play()/reset()...\n"); sys.stderr.flush()
     if _env_flag('ARENA_ISAAC_SKIP_WORLD_RESET', True):
         controller.get_logger().warn(
             'Skipping blocking Isaac World.reset() during Docker eval startup; '
-            'service callbacks will initialize spawned assets on demand.'
+            'will call world.play() to start simulation without full reset.'
         )
+        # Start the simulation without a full reset. world.reset() blocks
+        # for minutes because it re-initializes the RTX renderer. Instead,
+        # just ensure the timeline is playing so world.step() can advance
+        # physics and produce sensor data.
+        world.play()
+        sys.stderr.write("[ISAAC_DEBUG] world.play() completed.\n"); sys.stderr.flush()
     else:
         world.reset()
+        sys.stderr.write("[ISAAC_DEBUG] world.reset() completed.\n"); sys.stderr.flush()
 
     # Replicator
     #处理Ctrl+C 退出
@@ -674,10 +679,13 @@ def main(args=None):
         else:
             photoreal.PRESET_DEFAULT.apply()
 
-    # hard reset once
-    omni.timeline.get_timeline_interface().stop()
+    # Ensure timeline is playing for the main loop (do NOT stop it here;
+    # stopping the timeline after world.play()/world.reset() prevents
+    # world.step() from producing sensor data in the main loop).
+    # omni.timeline.get_timeline_interface().stop()
 
     # mainloop
+    sys.stderr.write("[ISAAC_DEBUG] Entering main loop...\n"); sys.stderr.flush()
     was_playing: bool = False
     suppressed_service_response_markers = (
         'response intentionally suppressed',
