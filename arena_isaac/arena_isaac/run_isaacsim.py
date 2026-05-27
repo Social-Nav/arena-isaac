@@ -637,6 +637,17 @@ def main(args=None):
         # physics and produce sensor data.
         world.play()
         sys.stderr.write("[ISAAC_DEBUG] world.play() completed.\n"); sys.stderr.flush()
+        # Warm up the RTX renderer: render a few frames so the pipeline
+        # initializes and cameras produce real scene images instead of
+        # blank gray buffers.
+        warmup_frames = int(os.environ.get('ARENA_ISAAC_RENDER_WARMUP_FRAMES', '5'))
+        if warmup_frames > 0:
+            controller.get_logger().info(
+                f'Warming up renderer with {warmup_frames} frames...'
+            )
+            for _ in range(warmup_frames):
+                world.step(render=True)
+            controller.get_logger().info('Renderer warmup complete.')
     else:
         world.reset()
         sys.stderr.write("[ISAAC_DEBUG] world.reset() completed.\n"); sys.stderr.flush()
@@ -668,10 +679,23 @@ def main(args=None):
     # signal.signal(signal.SIGHUP, emergency_save_handler)   # docker exec 断开时触发
     # set photoreal settings
     if _env_flag('ARENA_ISAAC_SKIP_PHOTOREAL', True):
-        controller.get_logger().warn(
-            'Skipping photoreal renderer preset during Docker eval startup; '
-            'this avoids blocking before ROS service callbacks are processed.'
-        )
+        # Even when skipping the full photoreal preset (which can block),
+        # we MUST set basic lighting or the camera renders blank gray frames.
+        # Apply a minimal lighting preset via carb settings to avoid the
+        # blocking omni.kit.actions path.
+        try:
+            import carb
+            settings = carb.settings.get_settings()
+            # Enable default stage lighting so cameras render real scenes
+            settings.set_string("/rtx/lightspeed/defaultLightPreset", "Default")
+            controller.get_logger().info(
+                'Applied minimal lighting preset (carb settings) for camera rendering.'
+            )
+        except Exception as e:
+            controller.get_logger().warn(
+                f'Failed to apply minimal lighting preset: {e}; '
+                'camera images may be blank. Set ARENA_ISAAC_SKIP_PHOTOREAL=0 to apply full preset.'
+            )
     else:
         import isaac_utils.config.photoreal as photoreal
         if os.environ.get('RENDER_PRESET', 'photoreal') != 'boring':
