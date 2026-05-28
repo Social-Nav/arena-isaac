@@ -48,6 +48,25 @@ FRAME_KEYWORDS = {
     'odomframeid', 'chassisframeid',
 }
 BASE_FRAME_DEFAULT = 'base_link'
+
+
+def _normalize_robot_spawn_name(name: str) -> str:
+    """Return the canonical Arena robot spawn name under /World/Robots.
+
+    Older manual callers sometimes pass a bare robot name (for example
+    ``Ai2_Bot2``), which `world_path()` maps to ``/World/Ai2_Bot2``.  The eval
+    stack, VLN logger, and reset/move path use ``/World/Robots/<name>``.  Keep
+    full /World paths and explicit Robots/* names intact, but canonicalize bare
+    robot names at the robot-specific service boundary.
+    """
+    normalized = str(name or '').strip().strip('/')
+    if not normalized:
+        return normalized
+    if normalized == 'World' or normalized.startswith('World/'):
+        return '/' + normalized
+    if normalized == 'Robots' or normalized.startswith('Robots/'):
+        return normalized
+    return os.path.join('Robots', normalized)
 BASE_FRAME_ATTRS = {
     'childframeid',
     'chassisframeid',
@@ -675,11 +694,11 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
     xform = UsdGeom.Xformable(camera.GetPrim())
     xform.ClearXformOpOrder()
     xform.AddTranslateOp().Set(Gf.Vec3d(float(request_pose.position.x), float(request_pose.position.y), 8.0))
-    # Keep the standalone sim_top_down camera in a true nadir view.
-    # Identity orientation points the Isaac/USD camera horizontally here, which
-    # produced the observed grey wall/corner frames instead of a top-down scene.
-    top_down_rotation = geom.Rotation.parse([0.0, -math.pi / 2.0, 0.0])
-    xform.AddOrientOp().Set(Gf.Quatf(top_down_rotation.w, top_down_rotation.x, top_down_rotation.y, top_down_rotation.z))
+    # USD cameras look along local -Z.  With the stage Z-up convention, an
+    # identity orientation at z=8 is a true nadir/top-down view.  Do not apply
+    # the URDF/Gazebo-style -90deg pitch here; that makes this standalone USD
+    # camera look horizontally and records a wall/floor strip.
+    xform.AddOrientOp().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
     carb.log_warn(
         f"[SpawnUsdRobot] Created top-down camera {top_down_camera_path} "
         f"at ({float(request_pose.position.x):.3f}, {float(request_pose.position.y):.3f}, 8.000)"
@@ -816,7 +835,8 @@ def _remap_namespace(prim_path: str, namespace: str, base_frame: str | None = No
 
 @on_exception('')
 def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
-    name = request.name
+    raw_name = str(request.name or '').strip().strip('/')
+    name = _normalize_robot_spawn_name(request.name)
     usd_path = request.usd_path
     
     # We overloaded the 'model' field to pass namespace and base_frame since
@@ -836,7 +856,7 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
     carb.log_warn(f"[SpawnUsdRobot] USD loaded at {prim_path}")
 
     usd_name = os.path.splitext(os.path.basename(usd_path))[0]
-    is_ai2_bot2 = name == 'Ai2_Bot2' or usd_name == 'Ai2_Bot2' or 'Ai2_Bot2' in usd_path
+    is_ai2_bot2 = raw_name.endswith('Ai2_Bot2') or usd_name == 'Ai2_Bot2' or 'Ai2_Bot2' in usd_path
 
     try:
         import omni.kit.app

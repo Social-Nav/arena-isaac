@@ -11,10 +11,37 @@ from isaacsim_msgs.srv import EditPrims
 from .utils import Service, on_exception
 
 
+def _resolve_existing_prim_path(name: str) -> str:
+    """Resolve legacy bare robot names to the canonical /World/Robots path.
+
+    Generic Isaac services still accept arbitrary prim names through
+    `world_path()`.  For robot reset/move compatibility, if the direct path does
+    not exist and a `/World/Robots/<name>` prim does, use the robot path instead.
+    """
+    prim_path = world_path(name)
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return prim_path
+    prim = stage.GetPrimAtPath(prim_path)
+    if prim and prim.IsValid():
+        return prim_path
+
+    raw = str(name or '').strip().strip('/')
+    if not raw or raw.startswith('World/') or raw.startswith('Robots/'):
+        return prim_path
+
+    robot_prim_path = world_path('Robots', raw)
+    robot_prim = stage.GetPrimAtPath(robot_prim_path)
+    if robot_prim and robot_prim.IsValid():
+        carb.log_warn(f"[EditPrims] Resolved legacy prim name '{name}' to {robot_prim_path}")
+        return robot_prim_path
+    return prim_path
+
+
 @on_exception(False)
 def move_prim(name: str, pose: Pose) -> bool:
     geom.move(
-        prim_path=world_path(name),
+        prim_path=_resolve_existing_prim_path(name),
         translation=geom.Translation.parse(pose.position),
         rotation=geom.Rotation.parse(pose.orientation),
     )
@@ -24,7 +51,7 @@ def move_prim(name: str, pose: Pose) -> bool:
 
 @on_exception(False)
 def move_attached_top_down_camera(name: str, pose: Pose) -> bool:
-    robot_prim_path = world_path(name)
+    robot_prim_path = _resolve_existing_prim_path(name)
     safe_name = robot_prim_path.strip('/').replace('/', '_')
     top_down_camera_path = f'/World/vln_top_down_camera_{safe_name}'
 
@@ -45,10 +72,11 @@ def move_attached_top_down_camera(name: str, pose: Pose) -> bool:
     geom.move(
         prim_path=top_down_camera_path,
         translation=geom.Translation(float(pose.position.x), float(pose.position.y), z),
-        # Keep the standalone top-down camera in a deterministic nadir view.
+        # Keep the standalone USD camera in a deterministic nadir view.  USD
+        # cameras look along local -Z, so identity at z=8 points straight down.
         # It is not parented under the robot, so every reset must explicitly
         # re-lock both its position and orientation to the reset pose.
-        rotation=geom.Rotation.parse([0.0, -math.pi / 2.0, 0.0]),
+        rotation=geom.Rotation(1.0, 0.0, 0.0, 0.0),
     )
     carb.log_warn(
         f"[EditPrims] Moved attached top-down camera {top_down_camera_path} "
@@ -66,7 +94,7 @@ def move_prim_with_attached_views(name: str, pose: Pose) -> bool:
 
 @on_exception(False)
 def scale_prim(name: str, scale: Scale) -> bool:
-    prim_path = world_path(name)
+    prim_path = _resolve_existing_prim_path(name)
 
     geom.rescale(
         prim_path=prim_path,
@@ -92,11 +120,7 @@ def edit_prims_callback(request: EditPrims.Request, response: EditPrims.Response
         results = (a and b for a, b in zip(results, map(scale_prim, (p.name for p in request.prims), (p.scale for p in request.prims))))
 
     response.ret = list(results)
-    carb.log_warn(
-        f"[EditPrims] Edited {sum(1 for ok in response.ret if ok)}/{len(response.ret)} prim(s); "
-        "suppressing ROS response to avoid Isaac embedded rclpy response conversion abort"
-    )
-    raise RuntimeError('EditPrims response intentionally suppressed after edit')
+    return response
 
 
 edit_prims_service = Service(

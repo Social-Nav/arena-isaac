@@ -1,5 +1,4 @@
 import numpy as np
-import carb
 
 from pedestrian.simulator.logic.people.person import Person
 from pedestrian.simulator.logic.people_manager import PeopleManager
@@ -45,11 +44,7 @@ def navigate_pedestrian(goal: PedestrianGoal) -> bool:
 
 def navigate_pedestrians_callback(request: NavigatePedestrians.Request, response: NavigatePedestrians.Response):
     response.ret = list(map(navigate_pedestrian, request.goals))
-    carb.log_warn(
-        f"[NavigatePedestrians] Updated {sum(1 for ok in response.ret if ok)}/{len(response.ret)} pedestrian target(s); "
-        "suppressing ROS response to avoid Isaac embedded rclpy response conversion abort"
-    )
-    raise RuntimeError('NavigatePedestrians response intentionally suppressed after navigation update')
+    return response
 
 
 navigate_pedestrians_service = Service(

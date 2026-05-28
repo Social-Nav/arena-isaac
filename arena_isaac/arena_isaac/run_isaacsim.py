@@ -10,27 +10,11 @@ import arena_simulation_setup.utils.cattrs
 # Use the isaacsim to import SimulationApp
 from isaacsim import SimulationApp
 
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    normalized = str(value).strip().lower()
-    if normalized in {'', '0', 'false', 'no', 'off'}:
-        return False
-    if normalized in {'1', 'true', 'yes', 'on'}:
-        return True
-    try:
-        return bool(int(normalized))
-    except ValueError:
-        return default
-
-
 # Setting the config for simulation and make an simulation.
 CONFIG = {
     #"renderer": "Wireframe",
-    "renderer": os.environ.get("ARENA_ISAAC_RENDERER", "RayTracedLighting"),
-    "headless": _env_flag("ARENA_ISAAC_HEADLESS", False),
+    "renderer": "RayTracedLighting",
+    "headless": False,
 }
 #import parent directory
 import sys
@@ -166,14 +150,7 @@ from isaac_utils.managers.door_manager import DoorManager
 from isaac_utils.managers.elevator_manager import elevator_manager
 
 #Import services
-try:
-    from arena_isaac.services import services
-except ImportError as e:
-    import carb
-    import traceback
-    carb.log_error(f"Failed to import services: {e}\n{traceback.format_exc()}")
-    services = []
-
+from arena_isaac.services import services
 from pedestrian.simulator.logic.people_manager import PeopleManager
 from rclpy.qos import QoSProfile
 from arena_isaac import run_after_tick_queue
@@ -328,7 +305,7 @@ class RaycastObstaclePublisher(rclpy.node.Node):
 class IsaacController(rclpy.node.Node):
     def __init__(self, *args, **kwargs):
         super().__init__(node_name="isaac", *args, **kwargs)
-        self._running = True
+        self._running = False
         self._should_step_once = False
 
         self.__pause_srv = self.create_service(
@@ -508,10 +485,8 @@ def main(args=None):
     sim = SimulationContext()
 
     IsaacController.wait_for_bridge()
-    sys.stderr.write("[ISAAC_DEBUG] Bridge ready, initializing rclpy...\n"); sys.stderr.flush()
     rclpy.init()
     controller = IsaacController()
-    sys.stderr.write("[ISAAC_DEBUG] Controller created.\n"); sys.stderr.flush()
 
     # Subscribe to task lifecycle events to control when data collection happens
     def _on_task_reset(msg: std_msgs.msg.Int16):
@@ -625,32 +600,7 @@ def main(args=None):
     )
 
     PublishTime('/World/publish_time')
-    sys.stderr.write("[ISAAC_DEBUG] About to world.play()/reset()...\n"); sys.stderr.flush()
-    if _env_flag('ARENA_ISAAC_SKIP_WORLD_RESET', True):
-        controller.get_logger().warn(
-            'Skipping blocking Isaac World.reset() during Docker eval startup; '
-            'will call world.play() to start simulation without full reset.'
-        )
-        # Start the simulation without a full reset. world.reset() blocks
-        # for minutes because it re-initializes the RTX renderer. Instead,
-        # just ensure the timeline is playing so world.step() can advance
-        # physics and produce sensor data.
-        world.play()
-        sys.stderr.write("[ISAAC_DEBUG] world.play() completed.\n"); sys.stderr.flush()
-        # Warm up the RTX renderer: render a few frames so the pipeline
-        # initializes and cameras produce real scene images instead of
-        # blank gray buffers.
-        warmup_frames = int(os.environ.get('ARENA_ISAAC_RENDER_WARMUP_FRAMES', '5'))
-        if warmup_frames > 0:
-            controller.get_logger().info(
-                f'Warming up renderer with {warmup_frames} frames...'
-            )
-            for _ in range(warmup_frames):
-                world.step(render=True)
-            controller.get_logger().info('Renderer warmup complete.')
-    else:
-        world.reset()
-        sys.stderr.write("[ISAAC_DEBUG] world.reset() completed.\n"); sys.stderr.flush()
+    world.reset()
 
     # Replicator
     #处理Ctrl+C 退出
@@ -678,59 +628,22 @@ def main(args=None):
     # signal.signal(signal.SIGTERM, emergency_save_handler)
     # signal.signal(signal.SIGHUP, emergency_save_handler)   # docker exec 断开时触发
     # set photoreal settings
-    if _env_flag('ARENA_ISAAC_SKIP_PHOTOREAL', True):
-        # Even when skipping the full photoreal preset (which can block),
-        # we MUST set basic lighting or the camera renders blank gray frames.
-        # Apply a minimal lighting preset via carb settings to avoid the
-        # blocking omni.kit.actions path.
-        try:
-            import carb
-            settings = carb.settings.get_settings()
-            # Enable default stage lighting so cameras render real scenes
-            settings.set_string("/rtx/lightspeed/defaultLightPreset", "Default")
-            controller.get_logger().info(
-                'Applied minimal lighting preset (carb settings) for camera rendering.'
-            )
-        except Exception as e:
-            controller.get_logger().warn(
-                f'Failed to apply minimal lighting preset: {e}; '
-                'camera images may be blank. Set ARENA_ISAAC_SKIP_PHOTOREAL=0 to apply full preset.'
-            )
+    import isaac_utils.config.photoreal as photoreal
+    if os.environ.get('RENDER_PRESET', 'photoreal') != 'boring':
+        photoreal.PRESET_PHOTOREAL.apply()
     else:
-        import isaac_utils.config.photoreal as photoreal
-        if os.environ.get('RENDER_PRESET', 'photoreal') != 'boring':
-            photoreal.PRESET_PHOTOREAL.apply()
-        else:
-            photoreal.PRESET_DEFAULT.apply()
+        photoreal.PRESET_DEFAULT.apply()
 
-    # Ensure timeline is playing for the main loop (do NOT stop it here;
-    # stopping the timeline after world.play()/world.reset() prevents
-    # world.step() from producing sensor data in the main loop).
-    # omni.timeline.get_timeline_interface().stop()
+    # hard reset once
+    omni.timeline.get_timeline_interface().stop()
 
     # mainloop
-    sys.stderr.write("[ISAAC_DEBUG] Entering main loop...\n"); sys.stderr.flush()
     was_playing: bool = False
-    suppressed_service_response_markers = (
-        'response intentionally suppressed',
-    )
     try:
         while simulation_app.is_running():
             stepped_this_iteration: bool = False
-            try:
-                rclpy.spin_once(controller, timeout_sec=0)
-            except RuntimeError as e:
-                if any(marker in str(e) for marker in suppressed_service_response_markers):
-                    controller.get_logger().warn(str(e))
-                else:
-                    raise
-            try:
-                rclpy.spin_once(raycast_pub, timeout_sec=0)
-            except RuntimeError as e:
-                if any(marker in str(e) for marker in suppressed_service_response_markers):
-                    controller.get_logger().warn(str(e))
-                else:
-                    raise
+            rclpy.spin_once(controller, timeout_sec=0)
+            rclpy.spin_once(raycast_pub, timeout_sec=0)
             if controller.running:
                 if not was_playing:
                     world.play()

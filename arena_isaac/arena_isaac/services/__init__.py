@@ -1,34 +1,39 @@
 import collections.abc
-import carb
 
+from .DeletePedestrians import delete_pedestrians_service
+from .DeletePrims import delete_prims_service
+from .EditPrims import edit_prims_service
+from .GetPrims import get_prims_service
+from .LoadUsdScene import load_usd_scene_service, load_usd_scene_srv_service
+from .NavigatePedestrians import navigate_pedestrians_service
+from .SpawnDoors import spawn_doors_service
+from .SpawnElevators import spawn_elevators_service
+from .SpawnFloors import spawn_floors_service
+from .SpawnPrims import spawn_prims_service
+from .SpawnPedestrians import spawn_pedestrians_service
+from .SpawnUrdf import spawn_urdf_service
+from .SpawnUsd import spawn_usd_service
+from .SpawnUsdRobot import spawn_usd_robot_service
+from .SpawnWalls import spawn_walls_service
 from .utils import Service
 
-services: list[Service] = []
-
-def _safe_import_service(module_name, service_name):
-    try:
-        from importlib import import_module
-        module = import_module(f".{module_name}", package=__name__)
-        service = getattr(module, service_name)
-        services.append(service)
-    except Exception as e:
-        carb.log_error(f"Failed to import service {service_name} from {module_name}: {e}")
-
-_safe_import_service("DeletePedestrians", "delete_pedestrians_service")
-_safe_import_service("DeletePrims", "delete_prims_service")
-_safe_import_service("EditPrims", "edit_prims_service")
-_safe_import_service("GetPrims", "get_prims_service")
-_safe_import_service("LoadUsdScene", "load_usd_scene_service")
-_safe_import_service("LoadUsdScene", "load_usd_scene_srv_service")
-_safe_import_service("NavigatePedestrians", "navigate_pedestrians_service")
-_safe_import_service("SpawnDoors", "spawn_doors_service")
-_safe_import_service("SpawnElevators", "spawn_elevators_service")
-_safe_import_service("SpawnFloors", "spawn_floors_service")
-_safe_import_service("SpawnPrims", "spawn_prims_service")
-_safe_import_service("SpawnPedestrians", "spawn_pedestrians_service")
-_safe_import_service("SpawnUrdf", "spawn_urdf_service")
-_safe_import_service("SpawnUsd", "spawn_usd_service")
-_safe_import_service("SpawnUsdRobot", "spawn_usd_robot_service")
-_safe_import_service("SpawnWalls", "spawn_walls_service")
+services: collections.abc.Iterable[Service] = (
+    delete_pedestrians_service,
+    delete_prims_service,
+    edit_prims_service,
+    get_prims_service,
+    load_usd_scene_service,
+    load_usd_scene_srv_service,
+    navigate_pedestrians_service,
+    spawn_doors_service,
+    spawn_elevators_service,
+    spawn_floors_service,
+    spawn_prims_service,
+    spawn_pedestrians_service,
+    spawn_urdf_service,
+    spawn_usd_service,
+    spawn_usd_robot_service,
+    spawn_walls_service,
+)
 
 __all__ = ["services"]

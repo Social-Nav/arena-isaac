@@ -1,6 +1,5 @@
 import math
 
-import carb
 import numpy as np
 import omni
 import omni.usd
@@ -57,11 +56,7 @@ def wall_spawner(wall: Wall) -> bool:
 
 def spawn_walls_callback(request: SpawnWalls.Request, response: SpawnWalls.Response):
     response.ret = list(map(wall_spawner, request.walls))
-    carb.log_warn(
-        f"[SpawnWalls] Spawned {sum(1 for ok in response.ret if ok)}/{len(response.ret)} wall segment(s); "
-        "suppressing ROS response to avoid Isaac embedded rclpy response conversion abort"
-    )
-    raise RuntimeError('SpawnWalls response intentionally suppressed after spawn setup')
+    return response
 
 
 spawn_walls_service = Service(

@@ -1,7 +1,6 @@
 import math
 import os
 
-import carb
 from omni.isaac.core import World
 from pedestrian.simulator.logic.people.person import Person
 from pedestrian.simulator.logic.people_manager import PeopleManager
@@ -44,11 +43,7 @@ def spawn_pedestrian(pedestrian: Pedestrian) -> bool:
 
 def spawn_pedestrians_callback(request: SpawnPedestrians.Request, response: SpawnPedestrians.Response):
     response.ret = list(map(spawn_pedestrian, request.pedestrians))
-    carb.log_warn(
-        f"[SpawnPedestrians] Spawned {sum(1 for ok in response.ret if ok)}/{len(response.ret)} pedestrian(s); "
-        "suppressing ROS response to avoid Isaac embedded rclpy response conversion abort"
-    )
-    raise RuntimeError('SpawnPedestrians response intentionally suppressed after spawn setup')
+    return response
 
 
 spawn_pedestrians_service = Service(

@@ -1,4 +1,3 @@
-import carb
 import omni
 
 from isaac_utils.utils.geom import Scale, Translation
@@ -36,11 +35,7 @@ def spawn_floor(floor: Floor) -> bool:
 
 def spawn_floors_callback(request: SpawnFloors.Request, response: SpawnFloors.Response):
     response.ret = list(map(spawn_floor, request.floors))
-    carb.log_warn(
-        f"[SpawnFloors] Spawned {sum(1 for ok in response.ret if ok)}/{len(response.ret)} floor(s); "
-        "suppressing ROS response to avoid Isaac embedded rclpy response conversion abort"
-    )
-    raise RuntimeError('SpawnFloors response intentionally suppressed after spawn setup')
+    return response
 
 
 spawn_floors_service = Service(

@@ -1,6 +1,5 @@
 from isaac_utils.managers.elevator_manager import elevator_manager
 import os
-import carb
 
 from rclpy.qos import QoSProfile
 
@@ -20,7 +19,6 @@ def spawn_elevator(elevator: Elevator) -> bool:
     prim_path = world_path(elevator.name)
     pos = geom.Translation.parse(elevator.position)
     size = geom.Scale.parse(elevator.size)
-    pos.z += size.z / 2.0
     material = elevator.material
     # Ensure parent path exists
     parent_path = os.path.dirname(prim_path)
@@ -44,11 +42,7 @@ def spawn_elevator(elevator: Elevator) -> bool:
 
 def spawn_elevators_callback(request: SpawnElevators.Request, response: SpawnElevators.Response):
     response.ret = list(map(spawn_elevator, request.elevators))
-    carb.log_warn(
-        f"[SpawnElevators] Spawned {sum(1 for ok in response.ret if ok)}/{len(response.ret)} elevator(s); "
-        "suppressing ROS response to avoid Isaac embedded rclpy response conversion abort"
-    )
-    raise RuntimeError('SpawnElevators response intentionally suppressed after spawn setup')
+    return response
 
 
 spawn_elevators_service = Service(
