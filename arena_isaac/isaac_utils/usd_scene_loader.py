@@ -27,6 +27,33 @@ except ImportError:
     from omni.isaac.core.utils import prims
 
 
+DEFAULT_CEILING_NAME_PATTERNS = ('ceiling', 'ceil', 'roof')
+
+
+def _parse_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {'1', 'true', 'yes', 'y', 'on'}:
+        return True
+    if text in {'0', 'false', 'no', 'n', 'off'}:
+        return False
+    return default
+
+
+def _is_grscenes_like_usd_path(usd_path: str) -> bool:
+    normalized = str(usd_path).replace('\\', '/').lower()
+    return (
+        'grscenes' in normalized
+        or '/commercial_scenes/scenes/' in normalized
+        or '/home_scenes/scenes/' in normalized
+    ) and normalized.endswith('.usd')
+
+
 class USDSceneLoader:
     """
     USD Scene Loader - loads external USD scenes into Isaac Sim.
@@ -60,6 +87,8 @@ class USDSceneLoader:
             load_config: Loading configuration options
                 - disable_collision_cooking: Disable collision cooking (faster loading)
                 - add_colliders_automatically: Auto-add colliders
+                - hide_ceiling_prims: Hide ceiling/roof prims for top-down debug rendering
+                - ceiling_name_patterns: Case-insensitive path/name substrings to hide
 
         Returns:
             bool: Whether loading succeeded
@@ -69,6 +98,21 @@ class USDSceneLoader:
 
         disable_cooking = load_config.get('disable_collision_cooking', True)
         auto_colliders = load_config.get('add_colliders_automatically', True)
+        hide_ceiling_config = load_config.get('hide_ceiling_prims', None)
+        if hide_ceiling_config is None:
+            hide_ceiling_config = os.environ.get('ARENA_ISAAC_HIDE_CEILING_PRIMS')
+        if hide_ceiling_config is None:
+            hide_ceiling_prims = _is_grscenes_like_usd_path(usd_path)
+        else:
+            hide_ceiling_prims = _parse_bool(hide_ceiling_config, False)
+
+        ceiling_name_patterns = load_config.get('ceiling_name_patterns') or []
+        if not ceiling_name_patterns:
+            env_patterns = os.environ.get('ARENA_ISAAC_CEILING_NAME_PATTERNS', '')
+            ceiling_name_patterns = [p.strip() for p in env_patterns.split(',') if p.strip()]
+        if not ceiling_name_patterns:
+            ceiling_name_patterns = list(DEFAULT_CEILING_NAME_PATTERNS)
+
         post_reference_updates = int(
             load_config.get(
                 'post_reference_updates',
@@ -130,6 +174,13 @@ class USDSceneLoader:
             # so the long scene-load latency is charged to LoadUsdScene itself.
             self._warm_stage_after_reference(scene_prim_path, post_reference_updates)
 
+            hidden_ceiling_count = 0
+            if hide_ceiling_prims:
+                hidden_ceiling_count = self.hide_ceiling_prims(
+                    scene_prim_path=scene_prim_path,
+                    name_patterns=ceiling_name_patterns,
+                )
+
             if auto_colliders:
                 self.add_colliders(scene_prim_path)
 
@@ -138,6 +189,7 @@ class USDSceneLoader:
                 'scale': effective_scale,
                 'position': position,
                 'orientation': orientation,
+                'hidden_ceiling_prims': hidden_ceiling_count,
             }
 
             carb.log_info(f"[USDSceneLoader] Successfully loaded: {scene_prim_path}")
@@ -193,6 +245,61 @@ class USDSceneLoader:
             carb.log_info("[USDSceneLoader] Disabled UJITSO collision cooking")
         except Exception as e:
             carb.log_warn(f"[USDSceneLoader] Failed to disable collision cooking: {e}")
+
+
+    def hide_ceiling_prims(
+        self,
+        scene_prim_path: str = "/World/Scene",
+        name_patterns: list[str] = None,
+    ) -> int:
+        """Hide ceiling-like prims from rendering without deleting scene geometry.
+
+        This authors a stronger USD visibility opinion (`invisible`) on prims
+        whose path/name matches configured substrings.  Physics and collision
+        data are left untouched; only Imageable render visibility changes, which
+        is enough for the standalone top-down debug camera to see into indoor
+        GRScenes rooms.
+        """
+        if name_patterns is None:
+            name_patterns = list(DEFAULT_CEILING_NAME_PATTERNS)
+
+        patterns = [str(pattern).strip().lower() for pattern in name_patterns if str(pattern).strip()]
+        if not patterns:
+            carb.log_warn("[USDSceneLoader] Ceiling hiding requested with no name patterns; skipped")
+            return 0
+
+        stage = omni.usd.get_context().get_stage()
+        scene_prim = stage.GetPrimAtPath(scene_prim_path) if stage else None
+
+        if scene_prim is None or not scene_prim.IsValid():
+            carb.log_error(f"[USDSceneLoader] Invalid prim for ceiling hiding: {scene_prim_path}")
+            return 0
+
+        hidden_count = 0
+        matched_examples = []
+        for prim in Usd.PrimRange(scene_prim):
+            prim_path = str(prim.GetPath())
+            prim_path_lower = prim_path.lower()
+            prim_name_lower = prim.GetName().lower()
+            if not any(pattern in prim_path_lower or pattern in prim_name_lower for pattern in patterns):
+                continue
+            if not prim.IsA(UsdGeom.Imageable):
+                continue
+
+            try:
+                imageable = UsdGeom.Imageable(prim)
+                imageable.CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+                hidden_count += 1
+                if len(matched_examples) < 5:
+                    matched_examples.append(prim_path)
+            except Exception as exc:
+                carb.log_warn(f"[USDSceneLoader] Failed to hide ceiling prim {prim_path}: {exc}")
+
+        carb.log_info(
+            f"[USDSceneLoader] Hid {hidden_count} ceiling-like prims under {scene_prim_path} "
+            f"using patterns={patterns}; examples={matched_examples}"
+        )
+        return hidden_count
 
 
     def add_colliders(
