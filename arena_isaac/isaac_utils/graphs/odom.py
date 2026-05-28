@@ -1,0 +1,81 @@
+import omni.graph.core as og
+
+from isaac_utils.graphs import Graph
+
+
+def odom(
+    graph_path: str,
+    prim_path: str,
+    base_frame_id: str = 'base_link',
+    odom_frame_id: str = 'odom',
+    map_frame_id: str = 'map',
+    odom_topic: str = '',
+) -> bool:
+    """
+    Creates an OmniGraph Action Graph to publish nav2 - type odometry information for a given prim
+    using ROS2.
+
+    Args:
+        graph_path(str): The USD path where the Action Graph will be created(e.g., '/ActionGraph').
+        prim_path(str): The USD path to the prim for which to publish odometry(e.g., '/World/MyRobot/chassis').
+        tf_prefix(str): The prefix to apply to the TF frames published by this graph(e.g., 'jackal').
+        base_frame_id(str): The name of the base frame for the robot(e.g., 'base_link').
+        odom_frame_id(str): The name of the odometry frame(e.g., 'odom').
+        map_frame_id(str): The name of the map frame(included for completeness but not used in this graph).
+
+    Returns:
+        bool: True if the graph was created successfully, False otherwise.
+    """
+
+    controller = og.Controller()
+
+    graph = Graph(graph_path)
+
+    on_playback_tick = graph.node('on_playback_tick', 'omni.graph.action.OnPlaybackTick')
+    read_simulation_time = graph.node('read_simulation_time', 'isaacsim.core.nodes.IsaacReadSimulationTime')
+    get_chassis_prim = graph.node('get_chassis_prim', 'omni.replicator.core.OgnGetPrimAtPath')
+    compute_odometry = graph.node('compute_odometry', 'isaacsim.core.nodes.IsaacComputeOdometry')
+    get_transform = graph.node('get_transform', 'omni.graph.nodes.GetPrimLocalToWorldTransform')
+    extract_translation = graph.node('extract_translation', 'omni.graph.nodes.GetMatrix4Translation')
+    extract_rotation = graph.node('extract_rotation', 'omni.graph.nodes.GetMatrix4Quaternion')
+    publish_map = graph.node('publish_odom_static', 'isaacsim.ros2.bridge.ROS2PublishRawTransformTree')
+    publish_odom = graph.node('publish_odom', 'isaacsim.ros2.bridge.ROS2PublishRawTransformTree')
+
+    on_playback_tick.connect('tick', publish_odom, 'execIn')
+    on_playback_tick.connect('tick', publish_map, 'execIn')
+    on_playback_tick.connect('tick', get_chassis_prim, 'execIn')
+    on_playback_tick.connect('tick', compute_odometry, 'execIn')
+    read_simulation_time.connect('simulationTime', publish_odom, 'timeStamp')
+    read_simulation_time.connect('simulationTime', publish_map, 'timeStamp')
+
+    get_chassis_prim.attribute('paths', [prim_path])
+    get_chassis_prim.connect('prims', compute_odometry, 'chassisPrim')
+
+    get_transform.attribute('primPath', prim_path)
+    get_transform.connect('localToWorldTransform', extract_translation, 'matrix')
+    get_transform.connect('localToWorldTransform', extract_rotation, 'matrix')
+
+    publish_odom.attribute('parentFrameId', odom_frame_id)
+    publish_odom.attribute('childFrameId', base_frame_id)
+    extract_translation.connect('translation', publish_odom, 'translation')
+    extract_rotation.connect('quaternion', publish_odom, 'rotation')
+
+    publish_map.attribute('parentFrameId', map_frame_id)
+    publish_map.attribute('childFrameId', odom_frame_id)
+    publish_map.attribute('translation', [0., 0., 0.])
+    publish_map.attribute('rotation', [0., 0., 0., 1.])
+
+    if odom_topic:
+        publish_odom_topic = graph.node('publish_odom_topic', 'isaacsim.ros2.bridge.ROS2PublishOdometry')
+        on_playback_tick.connect('tick', publish_odom_topic, 'execIn')
+        read_simulation_time.connect('simulationTime', publish_odom_topic, 'timeStamp')
+        publish_odom_topic.attribute('topicName', odom_topic)
+        publish_odom_topic.attribute('odomFrameId', odom_frame_id)
+        publish_odom_topic.attribute('chassisFrameId', base_frame_id)
+        extract_translation.connect('translation', publish_odom_topic, 'position')
+        extract_rotation.connect('quaternion', publish_odom_topic, 'orientation')
+        compute_odometry.connect('linearVelocity', publish_odom_topic, 'linearVelocity')
+        compute_odometry.connect('angularVelocity', publish_odom_topic, 'angularVelocity')
+
+    graph.load_extensions()
+    return graph.execute(controller)

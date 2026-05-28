@@ -1,0 +1,17 @@
+# python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints
+
+# ide
+.vscode/
+
+# build
+log
+install
+build
+IsaacLab
+*.gv
+*.pdf
+test.py
+checkpoint.py

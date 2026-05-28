@@ -1,0 +1,7 @@
+string name
+string model
+string usd_path
+bool control True
+geometry_msgs/Pose pose
+---
+bool ret
