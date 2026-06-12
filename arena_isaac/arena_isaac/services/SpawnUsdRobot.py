@@ -688,12 +688,15 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
     safe_name = prim_path.strip('/').replace('/', '_')
     top_down_camera_path = f'/World/vln_top_down_camera_{safe_name}'
     stage = omni.usd.get_context().get_stage()
+    camera_height = float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT', '30.0'))
+    near_clip = float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_NEAR_CLIP', '0.01'))
+    far_clip = float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_FAR_CLIP', '200.0'))
     camera = UsdGeom.Camera.Define(stage, top_down_camera_path)
     camera.CreateFocalLengthAttr().Set(12.0)
-    camera.CreateClippingRangeAttr().Set(Gf.Vec2f(0.01, 200.0))
+    camera.CreateClippingRangeAttr().Set(Gf.Vec2f(near_clip, far_clip))
     xform = UsdGeom.Xformable(camera.GetPrim())
     xform.ClearXformOpOrder()
-    xform.AddTranslateOp().Set(Gf.Vec3d(float(request_pose.position.x), float(request_pose.position.y), 8.0))
+    xform.AddTranslateOp().Set(Gf.Vec3d(float(request_pose.position.x), float(request_pose.position.y), camera_height))
     # USD cameras look along local -Z.  With the stage Z-up convention, an
     # identity orientation at z=8 is a true nadir/top-down view.  Do not apply
     # the URDF/Gazebo-style -90deg pitch here; that makes this standalone USD
@@ -701,7 +704,8 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
     xform.AddOrientOp().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
     carb.log_warn(
         f"[SpawnUsdRobot] Created top-down camera {top_down_camera_path} "
-        f"at ({float(request_pose.position.x):.3f}, {float(request_pose.position.y):.3f}, 8.000)"
+        f"at ({float(request_pose.position.x):.3f}, {float(request_pose.position.y):.3f}, {camera_height:.3f}) "
+        f"with clipping range ({near_clip:.3f}, {far_clip:.3f})"
     )
     return top_down_camera_path
 
@@ -858,12 +862,21 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
     usd_name = os.path.splitext(os.path.basename(usd_path))[0]
     is_ai2_bot2 = raw_name.endswith('Ai2_Bot2') or usd_name == 'Ai2_Bot2' or 'Ai2_Bot2' in usd_path
 
-    try:
-        import omni.kit.app
-        omni.kit.app.get_app().update()
-        carb.log_warn("[SpawnUsdRobot] Triggered app.update() for OmniGraph init")
-    except Exception as e:
-        carb.log_error(f"[SpawnUsdRobot] app.update() failed: {e}")
+    sync_app_update = str(
+        os.environ.get('ARENA_SPAWN_USD_ROBOT_SYNC_APP_UPDATE', '0')
+    ).strip().lower() not in {'0', 'false', 'no', 'off'}
+    if sync_app_update:
+        try:
+            from importlib import import_module
+            import_module('omni.kit.app').get_app().update()
+            carb.log_warn("[SpawnUsdRobot] Triggered app.update() for OmniGraph init")
+        except Exception as e:
+            carb.log_error(f"[SpawnUsdRobot] app.update() failed: {e}")
+    else:
+        carb.log_warn(
+            '[SpawnUsdRobot] Skipping synchronous app.update() because '
+            'ARENA_SPAWN_USD_ROBOT_SYNC_APP_UPDATE is disabled'
+        )
 
     articulation_prim_path = _find_articulation_root(prim_path)
     if articulation_prim_path is None:
@@ -899,11 +912,17 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
     try:
         if is_ai2_bot2:
             _setup_ai2_bot2_control_graph(prim_path, articulation_prim_path, namespace)
-            try:
-                import omni.kit.app
-                omni.kit.app.get_app().update()
-            except Exception:
-                pass
+            if sync_app_update:
+                try:
+                    from importlib import import_module
+                    import_module('omni.kit.app').get_app().update()
+                except Exception:
+                    pass
+            else:
+                carb.log_warn(
+                    '[SpawnUsdRobot] Skipping synchronous app.update() after Ai2_Bot2 graph setup because '
+                    'ARENA_SPAWN_USD_ROBOT_SYNC_APP_UPDATE is disabled'
+                )
     except Exception as e:
         carb.log_error(f"[SpawnUsdRobot] Ai2_Bot2 control graph setup failed: {e}\n{traceback.format_exc()}")
 
