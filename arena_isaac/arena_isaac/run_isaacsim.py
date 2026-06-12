@@ -27,6 +27,7 @@ sys.path.insert(0,str(parent_dir))
 # stdlib
 import queue
 import random
+import time
 import traceback
 
 # Import Isaac Sim dependencies
@@ -600,7 +601,17 @@ def main(args=None):
     )
 
     PublishTime('/World/publish_time')
-    world.reset()
+    initial_world_reset = str(
+        os.environ.get('ARENA_ISAAC_INITIAL_WORLD_RESET', '0')
+    ).strip().lower() not in {'0', 'false', 'no', 'off'}
+    if initial_world_reset:
+        carb.log_warn('[run_isaacsim] Running synchronous world.reset() before ROS service loop')
+        world.reset()
+    else:
+        carb.log_warn(
+            '[run_isaacsim] Skipping synchronous world.reset() before ROS service loop; '
+            'the main loop will advance Isaac with simulation_app.update()/world.step()'
+        )
 
     # Replicator
     #处理Ctrl+C 退出
@@ -629,20 +640,37 @@ def main(args=None):
     # signal.signal(signal.SIGHUP, emergency_save_handler)   # docker exec 断开时触发
     # set photoreal settings
     import isaac_utils.config.photoreal as photoreal
-    if os.environ.get('RENDER_PRESET', 'photoreal') != 'boring':
+    render_preset = os.environ.get('RENDER_PRESET')
+    if render_preset is None and str(os.environ.get('ARENA_ISAAC_HEADLESS', '0')).strip().lower() in {'1', 'true', 'yes', 'on'}:
+        render_preset = 'boring'
+    if (render_preset or 'photoreal') != 'boring':
         photoreal.PRESET_PHOTOREAL.apply()
     else:
-        photoreal.PRESET_DEFAULT.apply()
+        carb.log_warn('[run_isaacsim] Skipping viewport render preset actions for boring/headless mode')
 
-    # hard reset once
-    omni.timeline.get_timeline_interface().stop()
+    # Avoid synchronous timeline operations before the ROS service loop in
+    # headless eval; Isaac/Kit can block here and prevent service callbacks from
+    # being processed.  The main loop controls play/pause as episodes run.
+    initial_timeline_stop = str(
+        os.environ.get('ARENA_ISAAC_INITIAL_TIMELINE_STOP', '0')
+    ).strip().lower() not in {'0', 'false', 'no', 'off'}
+    if initial_timeline_stop:
+        carb.log_warn('[run_isaacsim] Stopping timeline before main loop')
+        omni.timeline.get_timeline_interface().stop()
+    else:
+        carb.log_warn('[run_isaacsim] Skipping synchronous timeline.stop() before ROS service loop')
 
     # mainloop
     was_playing: bool = False
+    rclpy_spin_timeout_sec = max(
+        float(os.environ.get('ARENA_ISAAC_RCLPY_SPIN_TIMEOUT_SEC', '0.001')),
+        0.0,
+    )
+    last_idle_heartbeat = time.monotonic()
     try:
         while simulation_app.is_running():
             stepped_this_iteration: bool = False
-            rclpy.spin_once(controller, timeout_sec=0)
+            rclpy.spin_once(controller, timeout_sec=rclpy_spin_timeout_sec)
             rclpy.spin_once(raycast_pub, timeout_sec=0)
             if controller.running:
                 if not was_playing:
@@ -707,7 +735,17 @@ def main(args=None):
                 if was_playing:
                     world.pause()
                     was_playing = False
-                simulation_app.update()
+                idle_update = str(
+                    os.environ.get('ARENA_ISAAC_IDLE_SIMULATION_APP_UPDATE', '0')
+                ).strip().lower() not in {'0', 'false', 'no', 'off'}
+                if idle_update:
+                    simulation_app.update()
+                else:
+                    time.sleep(0.001)
+                now = time.monotonic()
+                if now - last_idle_heartbeat >= 5.0:
+                    carb.log_warn('[run_isaacsim] ROS service loop heartbeat while simulation is paused')
+                    last_idle_heartbeat = now
 
             if stepped_this_iteration:
                 pending_actions = run_after_tick_queue.qsize()
