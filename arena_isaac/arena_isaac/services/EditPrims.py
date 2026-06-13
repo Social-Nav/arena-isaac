@@ -40,13 +40,11 @@ def _resolve_existing_prim_path(name: str) -> str:
 
 @on_exception(False)
 def move_prim(name: str, pose: Pose) -> bool:
-    geom.move(
+    return bool(geom.move(
         prim_path=_resolve_existing_prim_path(name),
         translation=geom.Translation.parse(pose.position),
         rotation=geom.Rotation.parse(pose.orientation),
-    )
-
-    return True
+    ))
 
 
 @on_exception(False)
