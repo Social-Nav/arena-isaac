@@ -245,7 +245,7 @@ def _teleport_articulation(
     container_path: str,
     translation: Translation | None,
     rotation: Rotation | None,
-):
+) -> bool:
     """Teleport an articulation to a new world pose.
 
     Two operations are always performed:
@@ -296,8 +296,22 @@ def _teleport_articulation(
                 art.set_joint_velocities(np.zeros_like(joint_vels))
         except Exception:
             pass
+        return True
     except Exception as e:
         carb.log_warn(f"[geom.move] Articulation({art_path}).set_world_poses FAILED: {e}")
+        try:
+            rigid = RigidPrim(art_path)
+            rigid.set_world_poses(pos_arr, rot_arr)
+            try:
+                rigid.set_linear_velocities(np.zeros((1, 3)))
+                rigid.set_angular_velocities(np.zeros((1, 3)))
+            except Exception:
+                pass
+            carb.log_warn(f"[geom.move] RigidPrim({art_path}).set_world_poses fallback succeeded")
+            return True
+        except Exception as rigid_exc:
+            carb.log_warn(f"[geom.move] RigidPrim({art_path}).set_world_poses fallback FAILED: {rigid_exc}")
+            return False
 
 
 def move(
@@ -306,19 +320,18 @@ def move(
     translation: Translation | None = None,
     rotation: Rotation | None = None,
     local: bool = False,
-):
+) -> bool:
     container_path = prim_path          # top-level robot Xform before registry resolve
     prim_path = _resolve_robot(prim_path)
     prim = Prim([prim_path])
 
     if not prim.valid:
         carb.log_warn(f"[geom.move] prim not valid: {prim_path}")
-        return
+        return False
 
     # Articulation (world-space): use direct PhysX interface on root body.
     if (not local) and all(p.HasAPI(UsdPhysics.ArticulationRootAPI) for p in prim.prims):
-        _teleport_articulation(prim_path, container_path, translation, rotation)
-        return
+        return _teleport_articulation(prim_path, container_path, translation, rotation)
 
     # Non-articulation or local-space fallback (RigidPrim / XformPrim).
     target = None
@@ -340,6 +353,7 @@ def move(
             np.array(np.atleast_2d(translation.tuple())) if translation is not None else None,
             np.array(np.atleast_2d(rotation.quat())) if rotation is not None else None,
         )
+    return True
 
 
 def get_world_translation(prim_path: str) -> Translation | None:
