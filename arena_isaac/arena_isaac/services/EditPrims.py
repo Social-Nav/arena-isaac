@@ -1,8 +1,9 @@
 from geometry_msgs.msg import Pose
-import math
+import os
 
 import carb
 import omni.usd
+from pxr import Sdf
 from isaac_utils.utils import geom
 from isaac_utils.utils.path import world_path
 from isaacsim_msgs.msg import Scale
@@ -62,10 +63,17 @@ def move_attached_top_down_camera(name: str, pose: Pose) -> bool:
         )
         return True
 
-    z = 8.0
-    translation = geom.get_world_translation(top_down_camera_path)
-    if translation is not None and math.isfinite(float(translation.z)):
-        z = float(translation.z)
+    if 'ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT' in os.environ:
+        z = float(os.environ['ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT'])
+    else:
+        z = float(pose.position.z) + float(
+            os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', '3.0')
+        )
+
+    top_down_camera_prim.CreateAttribute('arena:followBaseZ', Sdf.ValueTypeNames.Double).Set(float(pose.position.z))
+    top_down_camera_prim.CreateAttribute('arena:followRelativeHeight', Sdf.ValueTypeNames.Double).Set(
+        float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', '3.0'))
+    )
 
     geom.move(
         prim_path=top_down_camera_path,

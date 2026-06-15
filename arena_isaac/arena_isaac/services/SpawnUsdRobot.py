@@ -688,7 +688,12 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
     safe_name = prim_path.strip('/').replace('/', '_')
     top_down_camera_path = f'/World/vln_top_down_camera_{safe_name}'
     stage = omni.usd.get_context().get_stage()
-    camera_height = float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT', '30.0'))
+    if 'ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT' in os.environ:
+        camera_height = float(os.environ['ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT'])
+    else:
+        camera_height = float(request_pose.position.z) + float(
+            os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', '3.0')
+        )
     near_clip = float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_NEAR_CLIP', '0.01'))
     far_clip = float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_FAR_CLIP', '200.0'))
     camera = UsdGeom.Camera.Define(stage, top_down_camera_path)
@@ -697,6 +702,11 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
     xform = UsdGeom.Xformable(camera.GetPrim())
     xform.ClearXformOpOrder()
     xform.AddTranslateOp().Set(Gf.Vec3d(float(request_pose.position.x), float(request_pose.position.y), camera_height))
+    camera.GetPrim().CreateAttribute('arena:followPrimPath', Sdf.ValueTypeNames.String).Set(prim_path)
+    camera.GetPrim().CreateAttribute('arena:followBaseZ', Sdf.ValueTypeNames.Double).Set(float(request_pose.position.z))
+    camera.GetPrim().CreateAttribute('arena:followRelativeHeight', Sdf.ValueTypeNames.Double).Set(
+        float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', '3.0'))
+    )
     # USD cameras look along local -Z.  With the stage Z-up convention, an
     # identity orientation at z=8 is a true nadir/top-down view.  Do not apply
     # the URDF/Gazebo-style -90deg pitch here; that makes this standalone USD
@@ -784,6 +794,12 @@ def _remap_namespace(prim_path: str, namespace: str, base_frame: str | None = No
             name_lower = attr_name.split(':')[-1].lower()
 
             if name_lower in NAMESPACE_KEYWORDS:
+                if 'clock' in prim_path_str.lower():
+                    carb.log_warn(
+                        f"[SpawnUsdRobot] Skipping nodeNamespace on clock publisher "
+                        f"so Isaac publishes the canonical /clock topic: {prim_path_str}"
+                    )
+                    continue
                 if is_tf_node:
                     carb.log_warn(
                         f"[SpawnUsdRobot] Skipping nodeNamespace on TF node "

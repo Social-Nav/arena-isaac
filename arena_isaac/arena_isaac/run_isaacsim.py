@@ -10,11 +10,19 @@ import arena_simulation_setup.utils.cattrs
 # Use the isaacsim to import SimulationApp
 from isaacsim import SimulationApp
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    return str(os.environ.get(name, '1' if default else '0')).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
 # Setting the config for simulation and make an simulation.
+_headless = _env_flag('ARENA_ISAAC_HEADLESS', False)
 CONFIG = {
     #"renderer": "Wireframe",
-    "renderer": "RayTracedLighting",
-    "headless": False,
+    "renderer": os.environ.get('ARENA_ISAAC_RENDERER', 'RayTracedLighting'),
+    "headless": _headless,
+    "disable_viewport_updates": _env_flag('ARENA_ISAAC_DISABLE_VIEWPORT_UPDATES', _headless),
+    "sync_loads": _env_flag('ARENA_ISAAC_SYNC_LOADS', True),
 }
 #import parent directory
 import sys
@@ -43,7 +51,7 @@ from isaacsim.core.utils.extensions import enable_extension
 enable_extension("isaacsim.asset.importer.urdf")
 from isaacsim.asset.importer.urdf import _urdf
 from isaacsim.core.utils import extensions, prims, stage
-from pxr import Sdf
+from pxr import Gf, Sdf, UsdGeom
 
 try:
     from isaacsim.core.world import World
@@ -54,6 +62,8 @@ try:
     from isaacsim.core.api.simulation_context import SimulationContext
 except ImportError:
     from omni.isaac.core import SimulationContext
+
+from isaac_utils.utils import geom as isaac_geom
 
 EXTENSIONS_PEOPLE = [
     'omni.anim.people', 
@@ -200,6 +210,72 @@ light_1 = prims.create_prim(
     }
 )
 assets_root_path = get_assets_root_path_safe()
+
+
+def _camera_follow_target_from_name(camera_prim) -> str | None:
+    attr = camera_prim.GetAttribute('arena:followPrimPath')
+    if attr and attr.HasValue():
+        value = str(attr.Get() or '').strip()
+        if value:
+            return value
+    prefix = 'vln_top_down_camera_'
+    name = camera_prim.GetName()
+    if not name.startswith(prefix):
+        return None
+    # Backward-compatible fallback for cameras created before the follow target
+    # metadata existed.  Current robot path is /World/Robots/<robot_name>.
+    safe = name[len(prefix):]
+    if safe.startswith('World_Robots_'):
+        return '/World/Robots/' + safe[len('World_Robots_'):]
+    return None
+
+
+def _follow_vln_top_down_cameras() -> None:
+    if not _env_flag('ARENA_ISAAC_TOP_DOWN_CAMERA_FOLLOW_ROBOT', True):
+        return
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        return
+    absolute_height = os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT')
+    default_relative_height = float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', '3.0'))
+    world_prim = stage.GetPrimAtPath('/World')
+    camera_prims = world_prim.GetChildren() if world_prim and world_prim.IsValid() else []
+    for camera_prim in camera_prims:
+        if camera_prim.GetTypeName() != 'Camera' or not camera_prim.GetName().startswith('vln_top_down_camera_'):
+            continue
+        target_path = _camera_follow_target_from_name(camera_prim)
+        if not target_path:
+            continue
+        target_translation = isaac_geom.get_world_translation(target_path)
+        if target_translation is None:
+            continue
+        relative_height = default_relative_height
+        rel_attr = camera_prim.GetAttribute('arena:followRelativeHeight')
+        if rel_attr and rel_attr.HasValue():
+            try:
+                relative_height = float(rel_attr.Get())
+            except Exception:
+                relative_height = default_relative_height
+        base_z = None
+        base_z_attr = camera_prim.GetAttribute('arena:followBaseZ')
+        if base_z_attr and base_z_attr.HasValue():
+            try:
+                base_z = float(base_z_attr.Get())
+            except Exception:
+                base_z = None
+        z_reference = base_z if base_z is not None else float(target_translation.z)
+        z = float(absolute_height) if absolute_height is not None else z_reference + relative_height
+        xform = UsdGeom.Xformable(camera_prim)
+        translate_attr = camera_prim.GetAttribute('xformOp:translate')
+        if not translate_attr or not translate_attr.IsValid():
+            xform.ClearXformOpOrder()
+            xform.AddTranslateOp().Set(Gf.Vec3d(float(target_translation.x), float(target_translation.y), z))
+            xform.AddOrientOp().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+            continue
+        translate_attr.Set(Gf.Vec3d(float(target_translation.x), float(target_translation.y), z))
+        orient_attr = camera_prim.GetAttribute('xformOp:orient')
+        if orient_attr and orient_attr.IsValid():
+            orient_attr.Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
 
 # navmesh_enabled stays TRUE (default) so omni.anim.people properly registers characters
 # and initializes animation graphs (ag.get_character() works). 
@@ -666,6 +742,34 @@ def main(args=None):
         float(os.environ.get('ARENA_ISAAC_RCLPY_SPIN_TIMEOUT_SEC', '0.001')),
         0.0,
     )
+    render_every_n_steps = max(
+        int(os.environ.get('ARENA_ISAAC_RENDER_EVERY_N_STEPS', '6' if str(os.environ.get('ARENA_ISAAC_HEADLESS', '0')).strip().lower() in {'1', 'true', 'yes', 'on'} else '1')),
+        1,
+    )
+    # Do not force the very first post-unpause step to render in headless eval.
+    # GRScenes + multiple Replicator render products can spend several minutes
+    # compiling RTX/material state on that first rendered step.  If it happens
+    # before the first physics-only tick, /clock never advances and the task
+    # generator remains at eval_ready=reset_started even though Isaac is busy,
+    # which looks like a deadlock.  Let the first cheap physics tick publish
+    # /clock, then render on the normal cadence below.
+    initial_force_render_steps = max(
+        int(os.environ.get('ARENA_ISAAC_INITIAL_FORCE_RENDER_STEPS', '0')),
+        0,
+    )
+    initial_no_render_steps = max(
+        int(os.environ.get('ARENA_ISAAC_INITIAL_NO_RENDER_STEPS', '0')),
+        0,
+    )
+    pre_play_render_warmup_frames = max(
+        int(os.environ.get('ARENA_ISAAC_PRE_PLAY_RENDER_WARMUP_FRAMES', '0')),
+        0,
+    )
+    pre_play_render_warmup_method = str(
+        os.environ.get('ARENA_ISAAC_PRE_PLAY_RENDER_WARMUP_METHOD', 'simulation_app_update')
+    ).strip().lower()
+    sim_step_counter = 0
+    pre_play_warmup_pending = False
     last_idle_heartbeat = time.monotonic()
     try:
         while simulation_app.is_running():
@@ -674,11 +778,74 @@ def main(args=None):
             rclpy.spin_once(raycast_pub, timeout_sec=0)
             if controller.running:
                 if not was_playing:
+                    if not pre_play_warmup_pending:
+                        pre_play_warmup_pending = True
+                        carb.log_warn(
+                            '[run_isaacsim] Simulation unpaused; deferring play/step by one main-loop turn '
+                            'so the ROS service response can flush before any expensive render work'
+                        )
+                        rclpy.spin_once(controller, timeout_sec=0)
+                        continue
+
+                    if pre_play_render_warmup_frames > 0:
+                        warmup_started = time.monotonic()
+                        carb.log_warn(
+                            f'[run_isaacsim] Running {pre_play_render_warmup_frames} paused render warmup frame(s) '
+                            'before world.play(); this initializes heavy GRScenes/HuNav/RTX assets without advancing sim time'
+                        )
+                        for warmup_idx in range(pre_play_render_warmup_frames):
+                            frame_started = time.monotonic()
+                            try:
+                                if pre_play_render_warmup_method in {'rep', 'rep_orchestrator', 'orchestrator'}:
+                                    rep.orchestrator.step(delta_time=0.0, rt_subframes=1)
+                                else:
+                                    # Keep the timeline/world stopped while giving Kit/RTX/asset loading a render/update
+                                    # opportunity.  In heavy headless GRScenes, rep.orchestrator.step(delta_time=0.0)
+                                    # can block long enough that the eval-side sim-tick gate times out before world.play().
+                                    simulation_app.update()
+                            except Exception as exc:
+                                carb.log_warn(
+                                    f'[run_isaacsim] rep.orchestrator paused warmup failed on frame {warmup_idx + 1}: {exc}; '
+                                    'falling back to simulation_app.update()'
+                                )
+                                simulation_app.update()
+                            frame_elapsed = time.monotonic() - frame_started
+                            if frame_elapsed >= 5.0:
+                                carb.log_warn(
+                                    f'[run_isaacsim] paused render warmup frame {warmup_idx + 1}/'
+                                    f'{pre_play_render_warmup_frames} took {frame_elapsed:.3f}s'
+                                )
+                        carb.log_warn(
+                            f'[run_isaacsim] Paused render warmup completed in {time.monotonic() - warmup_started:.3f}s'
+                        )
+
                     world.play()
                     was_playing = True
+                    pre_play_warmup_pending = False
+                    sim_step_counter = 0
+                    continue
                 door_manager.update()
                 elevator_manager.update()
-                world.step(render=True)
+                sim_step_counter += 1
+                should_render = (
+                    sim_step_counter <= initial_force_render_steps
+                    or (
+                        sim_step_counter > initial_no_render_steps
+                        and (sim_step_counter % render_every_n_steps) == 0
+                    )
+                )
+                step_started = time.monotonic()
+                world.step(render=should_render)
+                _follow_vln_top_down_cameras()
+                step_elapsed = time.monotonic() - step_started
+                if step_elapsed >= 5.0:
+                    carb.log_warn(
+                        f'[run_isaacsim] world.step(render={should_render}) took {step_elapsed:.3f}s '
+                        f'(render_every_n_steps={render_every_n_steps}, '
+                        f'initial_no_render_steps={initial_no_render_steps}, '
+                        f'initial_force_render_steps={initial_force_render_steps}, '
+                        f'sim_step_counter={sim_step_counter})'
+                    )
                 stepped_this_iteration = True
                 # Start data collection and saving
                 if enable_logging:
@@ -735,6 +902,7 @@ def main(args=None):
                 if was_playing:
                     world.pause()
                     was_playing = False
+                pre_play_warmup_pending = False
                 idle_update = str(
                     os.environ.get('ARENA_ISAAC_IDLE_SIMULATION_APP_UPDATE', '0')
                 ).strip().lower() not in {'0', 'false', 'no', 'off'}

@@ -295,6 +295,8 @@ class Person:
 
     @staticmethod
     def _flush_app():
+        if str(os.environ.get("ARENA_ISAAC_PERSON_FLUSH_APP_UPDATE", "0")).strip().lower() in {"0", "false", "no", "off"}:
+            return
         try:
             omni.kit.app.get_app().update()
         except Exception:
