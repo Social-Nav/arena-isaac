@@ -63,16 +63,17 @@ def move_attached_top_down_camera(name: str, pose: Pose) -> bool:
         )
         return True
 
+    default_relative_height = '8.0'
     if 'ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT' in os.environ:
         z = float(os.environ['ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT'])
     else:
         z = float(pose.position.z) + float(
-            os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', '3.0')
+            os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', default_relative_height)
         )
 
     top_down_camera_prim.CreateAttribute('arena:followBaseZ', Sdf.ValueTypeNames.Double).Set(float(pose.position.z))
     top_down_camera_prim.CreateAttribute('arena:followRelativeHeight', Sdf.ValueTypeNames.Double).Set(
-        float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', '3.0'))
+        float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', default_relative_height))
     )
 
     geom.move(
