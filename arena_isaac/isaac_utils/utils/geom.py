@@ -33,6 +33,11 @@ def register_robot(robot_prim_path: str, articulation_prim_path: str):
         _robot_articulation_registry[robot_path] = articulation_path
 
 
+def registered_robots() -> dict[str, str]:
+    with _robot_articulation_registry_lock:
+        return dict(_robot_articulation_registry)
+
+
 def unregister_robot(prim_path: str):
     normalized_path = _normalize_prim_path(prim_path)
 
@@ -367,6 +372,31 @@ def get_world_translation(prim_path: str) -> Translation | None:
         transform = UsdGeom.Xformable(prim.prims[0]).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
         translation = transform.ExtractTranslation()
         return Translation(float(translation[0]), float(translation[1]), float(translation[2]))
+    except Exception:
+        return None
+
+
+def get_world_pose(prim_path: str) -> tuple[Translation, Rotation] | None:
+    prim_path = _resolve_robot(prim_path)
+    prim = Prim([prim_path])
+
+    if not prim.valid or not prim.prims:
+        return None
+
+    try:
+        transform = UsdGeom.Xformable(prim.prims[0]).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        translation = transform.ExtractTranslation()
+        rotation = transform.ExtractRotationQuat()
+        imaginary = rotation.GetImaginary()
+        return (
+            Translation(float(translation[0]), float(translation[1]), float(translation[2])),
+            Rotation(
+                w=float(rotation.GetReal()),
+                x=float(imaginary[0]),
+                y=float(imaginary[1]),
+                z=float(imaginary[2]),
+            ),
+        )
     except Exception:
         return None
 

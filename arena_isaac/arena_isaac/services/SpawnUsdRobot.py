@@ -48,6 +48,35 @@ FRAME_KEYWORDS = {
     'odomframeid', 'chassisframeid',
 }
 BASE_FRAME_DEFAULT = 'base_link'
+_VLN_CAMERA_REPLICATOR_HANDLES = []
+_VLN_CAMERA_PUBLISH_SPECS = {}
+
+
+def get_vln_camera_publish_specs() -> list[dict]:
+    return [dict(spec) for spec in _VLN_CAMERA_PUBLISH_SPECS.values()]
+
+
+def _register_vln_camera_publish_spec(
+    *,
+    key: str,
+    camera_prim_path: str,
+    namespace: str,
+    camera_topic: str,
+    frame: str,
+    resolution: tuple[int, int],
+    publish_depth: bool,
+):
+    topic_base = f"/{namespace.strip('/')}/{camera_topic.strip('/')}" if namespace else f"/{camera_topic.strip('/')}"
+    _VLN_CAMERA_PUBLISH_SPECS[key] = {
+        'key': key,
+        'camera_prim_path': str(camera_prim_path),
+        'namespace': str(namespace or ''),
+        'camera_topic': str(camera_topic),
+        'topic_base': topic_base,
+        'frame': str(frame),
+        'resolution': [int(resolution[0]), int(resolution[1])],
+        'publish_depth': bool(publish_depth),
+    }
 
 
 def _normalize_robot_spawn_name(name: str) -> str:
@@ -632,6 +661,7 @@ def _publish_camera_info(render_product: str, frame: str, namespace: str, camera
         'PostProcessDispatchIsaacSimulationGate', render_product_path
     )
     og.Controller.attribute(gate_path + '.inputs:step').set(step_size)
+    return writer
 
 
 def _publish_rgb(render_product: str, frame: str, namespace: str, camera_topic: str, step_size: int):
@@ -647,11 +677,13 @@ def _publish_rgb(render_product: str, frame: str, namespace: str, camera_topic: 
     writer.attach([render_product])
     gate_path = omni.syntheticdata.SyntheticData._get_node_path(rv + 'IsaacSimulationGate', render_product_path)
     og.Controller.attribute(gate_path + '.inputs:step').set(step_size)
+    return writer
 
 
 def _publish_depth(render_product: str, frame: str, namespace: str, camera_topic: str, step_size: int):
     render_product_path = _render_product_path(render_product)
     rv = omni.syntheticdata.SyntheticData.convert_sensor_type_to_rendervar(sd.SensorType.DistanceToImagePlane.name)
+    writers = []
     for suffix in ('depth', 'depth_image'):
         writer = rep.writers.get(rv + 'ROS2PublishImage')
         writer.initialize(
@@ -661,8 +693,10 @@ def _publish_depth(render_product: str, frame: str, namespace: str, camera_topic
             topicName=os.path.join(camera_topic, suffix),
         )
         writer.attach([render_product])
+        writers.append(writer)
     gate_path = omni.syntheticdata.SyntheticData._get_node_path(rv + 'IsaacSimulationGate', render_product_path)
     og.Controller.attribute(gate_path + '.inputs:step').set(step_size)
+    return writers
 
 
 def _find_named_camera_prim(prim_path: str, preferred_name: str) -> str | None:
@@ -688,13 +722,19 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
     safe_name = prim_path.strip('/').replace('/', '_')
     top_down_camera_path = f'/World/vln_top_down_camera_{safe_name}'
     stage = omni.usd.get_context().get_stage()
+    default_relative_height = '8.0'
     if 'ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT' in os.environ:
         camera_height = float(os.environ['ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_HEIGHT'])
     else:
         camera_height = float(request_pose.position.z) + float(
-            os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', '3.0')
+            os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', default_relative_height)
         )
-    near_clip = float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_NEAR_CLIP', '0.01'))
+    # Keep the qualitative top-down review camera from rendering ceiling/upper
+    # wall geometry close to the camera while preserving the floor, robot, and
+    # pedestrians below.
+    height_above_base = max(0.01, camera_height - float(request_pose.position.z))
+    default_near_clip = max(0.01, height_above_base - 2.5)
+    near_clip = float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_NEAR_CLIP', str(default_near_clip)))
     far_clip = float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_FAR_CLIP', '200.0'))
     camera = UsdGeom.Camera.Define(stage, top_down_camera_path)
     camera.CreateFocalLengthAttr().Set(12.0)
@@ -705,7 +745,7 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
     camera.GetPrim().CreateAttribute('arena:followPrimPath', Sdf.ValueTypeNames.String).Set(prim_path)
     camera.GetPrim().CreateAttribute('arena:followBaseZ', Sdf.ValueTypeNames.Double).Set(float(request_pose.position.z))
     camera.GetPrim().CreateAttribute('arena:followRelativeHeight', Sdf.ValueTypeNames.Double).Set(
-        float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', '3.0'))
+        float(os.environ.get('ARENA_SPAWN_USD_ROBOT_TOP_DOWN_CAMERA_RELATIVE_HEIGHT', default_relative_height))
     )
     # USD cameras look along local -Z.  With the stage Z-up convention, an
     # identity orientation at z=8 is a true nadir/top-down view.  Do not apply
@@ -721,6 +761,7 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
 
 
 def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str | None, request_pose) -> bool:
+    global _VLN_CAMERA_REPLICATOR_HANDLES
     if rep is None or sd is None or read_camera_info is None:
         carb.log_error('[SpawnUsdRobot] Cannot publish VLN cameras: Replicator/ROS2 bridge camera APIs unavailable')
         return False
@@ -737,10 +778,24 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
         return False
     else:
         try:
-            head_rp = rep.create.render_product(head_camera_path, (640, 480))
-            _publish_camera_info(head_rp, head_frame, namespace, 'head_camera', step_size)
-            _publish_rgb(head_rp, head_frame, namespace, 'head_camera', step_size)
-            _publish_depth(head_rp, head_frame, namespace, 'head_camera', step_size)
+            head_resolution = (640, 480)
+            head_rp = rep.create.render_product(head_camera_path, head_resolution)
+            head_handles = [
+                head_rp,
+                _publish_camera_info(head_rp, head_frame, namespace, 'head_camera', step_size),
+                _publish_rgb(head_rp, head_frame, namespace, 'head_camera', step_size),
+                *_publish_depth(head_rp, head_frame, namespace, 'head_camera', step_size),
+            ]
+            _VLN_CAMERA_REPLICATOR_HANDLES.extend(head_handles)
+            _register_vln_camera_publish_spec(
+                key=f'{namespace}:head_camera',
+                camera_prim_path=head_camera_path,
+                namespace=namespace,
+                camera_topic='head_camera',
+                frame=head_frame,
+                resolution=head_resolution,
+                publish_depth=True,
+            )
             carb.log_warn(f'[SpawnUsdRobot] Publishing head camera {head_camera_path} on /{namespace}/head_camera/*')
         except Exception as e:
             carb.log_error(f'[SpawnUsdRobot] Failed to create head_camera ROS publishers: {e}\n{traceback.format_exc()}')
@@ -748,9 +803,23 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
 
     try:
         top_down_path = _ensure_top_down_camera(prim_path, request_pose, namespace)
-        top_rp = rep.create.render_product(top_down_path, (640, 640))
-        _publish_camera_info(top_rp, top_down_frame, namespace, 'top_down_camera', step_size)
-        _publish_rgb(top_rp, top_down_frame, namespace, 'top_down_camera', step_size)
+        top_resolution = (640, 640)
+        top_rp = rep.create.render_product(top_down_path, top_resolution)
+        top_handles = [
+            top_rp,
+            _publish_camera_info(top_rp, top_down_frame, namespace, 'top_down_camera', step_size),
+            _publish_rgb(top_rp, top_down_frame, namespace, 'top_down_camera', step_size),
+        ]
+        _VLN_CAMERA_REPLICATOR_HANDLES.extend(top_handles)
+        _register_vln_camera_publish_spec(
+            key=f'{namespace}:top_down_camera',
+            camera_prim_path=top_down_path,
+            namespace=namespace,
+            camera_topic='top_down_camera',
+            frame=top_down_frame,
+            resolution=top_resolution,
+            publish_depth=False,
+        )
         carb.log_warn(f'[SpawnUsdRobot] Publishing top-down camera {top_down_path} on /{namespace}/top_down_camera/*')
     except Exception as e:
         carb.log_error(f'[SpawnUsdRobot] Failed to create top_down_camera ROS publishers: {e}\n{traceback.format_exc()}')
