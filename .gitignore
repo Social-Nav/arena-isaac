@@ -16,3 +16,6 @@ IsaacLab
 test.py
 checkpoint.py
 arena_isaac/output/
+
+# local data-collection runner (not shared)
+arena_isaac/arena_isaac/run_single_collection.sh

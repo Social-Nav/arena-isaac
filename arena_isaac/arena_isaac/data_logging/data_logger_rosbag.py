@@ -1,4 +1,4 @@
-"""RosBag-based data logger for VLN dataset recording (lightweight)."""
+"""RosBag-based data logger for dataset recording (lightweight)."""
 
 import os
 import sys
@@ -10,11 +10,11 @@ from typing import Dict, List, Optional
 from collections import defaultdict
 
 
-class VLNDataLoggerRosbag:
+class DataLoggerRosbag:
     """Lightweight rosbag command-line based data recorder.
     
     Usage:
-        logger = VLNDataLoggerRosbag(
+        logger = DataLoggerRosbag(
             topics=["/camera/image_raw", "/lidar/points", "/tf"],
             output_dir="collected_data"
         )
@@ -45,7 +45,7 @@ class VLNDataLoggerRosbag:
         self.bag_path = None
         self._recording = False
         
-        sys.stderr.write(f"[INIT] VLNDataLoggerRosbag ready to record {len(topics)} topics\n")
+        sys.stderr.write(f"[INIT] DataLoggerRosbag ready to record {len(topics)} topics\n")
 
     def start_recording(self):
         """Start background rosbag recording."""
@@ -122,7 +122,7 @@ class VLNDataLoggerRosbag:
         return False
 
 
-class VLNDataBufferRosbag:
+class DataBufferRosbag:
     """Async data buffer for post-processing MCAP files."""
     
     def __init__(self, mcap_file_path: str, topic_filters: List[str] = None):
@@ -211,7 +211,7 @@ def run_logger(topics: List[str],
         duration_seconds: Recording duration (None = manual stop)
         output_dir: Output directory
     """
-    logger = VLNDataLoggerRosbag(
+    logger = DataLoggerRosbag(
         topics=topics,
         output_dir=output_dir
     )
