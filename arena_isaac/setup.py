@@ -25,6 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             "run_isaacsim=arena_isaac.run_isaacsim:main",
+            "proactive_yielding_trigger=arena_isaac.social_yielding.proactive_yielding_trigger:main",
+            "social_yielding_orchestrator=arena_isaac.social_yielding.social_yielding_orchestrator:main",
         ],
     },
 )

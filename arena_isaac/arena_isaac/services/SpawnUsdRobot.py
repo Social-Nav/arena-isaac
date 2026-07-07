@@ -35,15 +35,15 @@ NAMESPACE_KEYWORDS = {'nodenamespace'}
 def _override_lidar_attrs(
     prim_path: str,
     near_range_m: float = 0.8,
-    scan_rate_hz: int = 30,
+    scan_rate_hz: int = 20,
+    report_rate_hz: int = 32000,
 ) -> int:
     """Override perception-relevant attributes on every OmniLidar prim under
-    `prim_path`:
-      - `nearRangeM`: skip the profile's default 1.0m blind zone so close-range
-        hits (e.g. pedestrians next to the robot) are not culled.
-      - `scanRateBaseHz`: raise scan rate to reduce dropouts and feed costmap
-        faster. `reportRateBaseHz` is scaled proportionally so per-scan sample
-        count stays the same (avoids rewriting the per-channel ray tables).
+    `prim_path`.
+
+    Uses fixed reportRateBaseHz (default 32000, matching Isaac 5.1 sensor
+    profile) to avoid timing conflicts with referenced sensor models whose
+    fireTimeNs exceeds 1e9/reportRateBaseHz.
 
     Returns the number of lidar prims updated.
     """
@@ -65,27 +65,16 @@ def _override_lidar_attrs(
         try:
             _set(prim, "omni:sensor:Core:nearRangeM",
                  Sdf.ValueTypeNames.Float, float(near_range_m))
-
-            # Read current scanRate to compute proportional reportRate scale-up
-            cur_scan_attr = prim.GetAttribute("omni:sensor:Core:scanRateBaseHz")
-            cur_report_attr = prim.GetAttribute("omni:sensor:Core:reportRateBaseHz")
-            cur_scan = int(cur_scan_attr.Get()) if (cur_scan_attr and cur_scan_attr.Get() is not None) else 10
-            cur_report = int(cur_report_attr.Get()) if (cur_report_attr and cur_report_attr.Get() is not None) else cur_scan * 360
-
-            samples_per_scan = max(1, int(round(cur_report / max(1, cur_scan))))
-            new_report = int(scan_rate_hz) * samples_per_scan
-
             _set(prim, "omni:sensor:Core:scanRateBaseHz",
                  Sdf.ValueTypeNames.UInt, int(scan_rate_hz))
             _set(prim, "omni:sensor:Core:reportRateBaseHz",
-                 Sdf.ValueTypeNames.UInt, int(new_report))
+                 Sdf.ValueTypeNames.UInt, int(report_rate_hz))
 
             carb.log_warn(
                 f"[SpawnUsdRobot] Lidar override on {prim.GetPath()}: "
                 f"nearRangeM={near_range_m}, "
-                f"scanRateBaseHz {cur_scan}->{scan_rate_hz}, "
-                f"reportRateBaseHz {cur_report}->{new_report} "
-                f"({samples_per_scan} samples/scan)"
+                f"scanRateBaseHz={scan_rate_hz}, "
+                f"reportRateBaseHz={report_rate_hz}"
             )
             updated += 1
         except Exception as e:
@@ -490,7 +479,7 @@ def spawn_usd_robot(request: SpawnUsdRobot.Request) -> str:
         carb.log_error(f"[SpawnUsdRobot] app.update() failed: {e}")
 
     try:
-        n = _override_lidar_attrs(prim_path, near_range_m=0.8, scan_rate_hz=10)
+        n = _override_lidar_attrs(prim_path, near_range_m=0.8, scan_rate_hz=20)
         carb.log_warn(f"[SpawnUsdRobot] Lidar attribute override applied to {n} sensor(s)")
     except Exception as e:
         carb.log_warn(f"[SpawnUsdRobot] Lidar attribute override failed: {e}")

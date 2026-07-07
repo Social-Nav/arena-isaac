@@ -91,8 +91,8 @@ try:
 except ImportError:
     HAS_MCAP = False
 
-class VLNDataLoggerReplicator:
-    """Replicator-based VLN dataset logger using Isaac Sim annotators."""
+class DataLoggerReplicator:
+    """Replicator-based dataset logger using Isaac Sim annotators."""
     
     def __init__(self, camera_prim_path, pedestrian_root_path, lidar_prim_path, output_dir="collected_data"):
         """Initialize logger.
@@ -110,10 +110,12 @@ class VLNDataLoggerReplicator:
             sys.stderr.write(f"[OK] Camera path found: {camera_prim_path}\n")
 
         self.output_dir = output_dir
+        self.camera_prim_path = camera_prim_path
 
         # Create timestamped session dir only when logger is instantiated (save_data=true)
         import datetime
-        session_name = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        beijing_time = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+        session_name = beijing_time.strftime("%Y-%m-%d_%H-%M-%S")
         self.session_dir = os.path.join(output_dir, session_name)
         old_umask = os.umask(0)
         os.makedirs(self.session_dir, mode=0o777, exist_ok=True)
@@ -125,6 +127,7 @@ class VLNDataLoggerReplicator:
         self.depth_frame_buffer = []
         self._stream_chunk_idx = 0
         self._pending_saves = []
+        self._skip_frames_after_rebuild = 0  # warmup ticks after a rebuild
 
         # Create render product for camera
         self.camera_rp = rep.create.render_product(camera_prim_path, (1280, 720))
@@ -443,6 +446,8 @@ class VLNDataLoggerReplicator:
         temp_list = []
         
         for ped_path in child_paths:
+            if ped_path.endswith("_lidar_proxy"):
+                continue
             # Recursively find node with animated motion
             bone_path = self.find_bone_root_recursive(get_prim_at_path(ped_path))
             
@@ -578,10 +583,46 @@ class VLNDataLoggerReplicator:
             
         return curr_peds_dict
     
+    def reset_render_product(self, warmup_frames: int = 60):
+        """Rebuild render product and annotators after robot respawn.
+
+        Call this from _on_task_reset (after the simulation tick that spawns
+        the robot), not from inside step(). Isaac needs several rendered frames
+        before get_data() returns valid data on a newly created render product.
+        """
+        try:
+            for annot in (self.rgb_annot, self.depth_annot, self.cam_params_annot):
+                try:
+                    annot.detach(self.camera_rp)
+                except Exception:
+                    pass
+            try:
+                self.camera_rp.destroy()
+            except Exception:
+                pass
+            self.camera_rp = rep.create.render_product(self.camera_prim_path, (1280, 720))
+            self.rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+            self.depth_annot = rep.AnnotatorRegistry.get_annotator("distance_to_camera")
+            self.cam_params_annot = rep.AnnotatorRegistry.get_annotator("camera_params")
+            self.rgb_annot.attach(self.camera_rp)
+            self.depth_annot.attach(self.camera_rp)
+            self.cam_params_annot.attach(self.camera_rp)
+            self._skip_frames_after_rebuild = warmup_frames
+            sys.stderr.write(f"[Logger] Render product rebuilt, skipping {warmup_frames} warmup frames.\n")
+        except Exception as e:
+            sys.stderr.write(f"[Logger] reset_render_product failed: {e}\n")
+
     def step(self, step_idx, language_instruction="navigate"):
         """
         Call this after env.step()
         """
+
+        # Warmup skip after annotator rebuild — give the renderer time to settle
+        if self._skip_frames_after_rebuild > 0:
+            self._skip_frames_after_rebuild -= 1
+            if self._skip_frames_after_rebuild == 0:
+                sys.stderr.write(f"[Logger] Warmup complete, resuming data capture.\n")
+            return
 
         # Pre-init variables to avoid UnboundLocalError
         rgb = None
@@ -590,36 +631,22 @@ class VLNDataLoggerReplicator:
         width = 1280 # resolution you set
         height = 720
 
-        # Try to get data
+        # Try to get camera data
         try:
             rgb = self.rgb_annot.get_data()
             params = self.cam_params_annot.get_data()
             depth = self.depth_annot.get_data()
-            curr_ped_pos = self.get_pedestrian_state()
-            
-            # Get LIDAR point cloud data
-            '''lidar_points = None
-            if self.lidar_annot is not None:
-                lidar_data = self.lidar_annot.get_data()
-
-                if lidar_data is not None: # print debug every 10 frames
-                    # Point cloud is usually an [N, 3] coordinate array
-                    points = lidar_data.get("data", np.array([]))
-
-                    # Save PLY
-                    # if step_idx % 100 == 0:
-                    #     self.save_points_as_ply(points, f"step_{step_idx:06d}.ply")
-                    # lidar_points = points.astype(np.float32) 
-
-                else :
-                    sys.stderr.write(f"[DEBUG] lidar_data is None.\n")
-                    
-            else:
-                sys.stderr.write(f"[DEBUG] ⚠️ lidar_annot is None\n")'''
-                        
         except Exception as e:
-            sys.stderr.write(f"Failed to get data: {e}\n")
+            sys.stderr.write(f"[Logger] Camera get_data failed: {e}\n")
             return
+
+        # Try to get pedestrian state — failures here should not block camera capture
+        try:
+            curr_ped_pos = self.get_pedestrian_state()
+        except Exception as e:
+            sys.stderr.write(f"[Logger] Pedestrian state failed (will reinit next frame): {e}\n")
+            self.pedestrian_prims = []  # force re-scan next step
+            curr_ped_pos = {"none": [0.0] * 16}
 
         # Check data integrity
         if rgb is None or depth is None or params is None:
@@ -706,7 +733,7 @@ class VLNDataLoggerReplicator:
         self.depth_frame_buffer = []
         self._stream_chunk_idx += 1
 
-        ep_dir = os.path.join(self.session_dir, f"episode_{ep_idx:06d}")
+        ep_dir = os.path.join(self.session_dir, f"episode_{ep_idx:02d}")
         old_umask = os.umask(0)
         os.makedirs(os.path.join(ep_dir, "rgb_videos"),   mode=0o777, exist_ok=True)
         os.makedirs(os.path.join(ep_dir, "depth_videos"), mode=0o777, exist_ok=True)
@@ -715,16 +742,16 @@ class VLNDataLoggerReplicator:
         rgb_path   = os.path.join(ep_dir, "rgb_videos",   f"chunk_{chunk_idx:04d}.npy")
         depth_path = os.path.join(ep_dir, "depth_videos", f"chunk_{chunk_idx:04d}.npy")
 
-        sys.stderr.write(f"[Flush] ep={ep_idx:06d} chunk={chunk_idx:04d} ({len(rgb_frames)} frames)\n")
+        sys.stderr.write(f"[Flush] ep={ep_idx:02d} chunk={chunk_idx:04d} ({len(rgb_frames)} frames)\n")
         sys.stderr.flush()
 
         def _write():
             try:
                 np.save(rgb_path,   np.stack(rgb_frames))
                 np.save(depth_path, np.stack(depth_frames))
-                sys.stderr.write(f"[Flush] chunk {ep_idx:06d}/{chunk_idx:04d} saved.\n")
+                sys.stderr.write(f"[Flush] chunk {ep_idx:02d}/{chunk_idx:04d} saved.\n")
             except Exception as e:
-                sys.stderr.write(f"[Flush] chunk {ep_idx:06d}/{chunk_idx:04d} failed: {e}\n")
+                sys.stderr.write(f"[Flush] chunk {ep_idx:02d}/{chunk_idx:04d} failed: {e}\n")
             sys.stderr.flush()
 
         t = threading.Thread(target=_write, daemon=True, name=f"flush-ep{ep_idx}-ch{chunk_idx}")
@@ -755,7 +782,7 @@ class VLNDataLoggerReplicator:
         self.param_buffer = []
         self._stream_chunk_idx = 0
 
-        ep_dir = os.path.join(self.session_dir, f"episode_{episode_idx:06d}")
+        ep_dir = os.path.join(self.session_dir, f"episode_{episode_idx:02d}")
         old_umask = os.umask(0)
         os.makedirs(os.path.join(ep_dir, "data"), mode=0o777, exist_ok=True)
         os.umask(old_umask)
@@ -765,26 +792,26 @@ class VLNDataLoggerReplicator:
             try:
                 with open(json_path, "w") as f:
                     json.dump(param_buf, f)
-                sys.stderr.write(f"[Save] Episode {episode_idx:06d} saved ({len(param_buf)} frames, {n_chunks} image chunks).\n")
+                sys.stderr.write(f"[Save] Episode {episode_idx:02d} saved ({len(param_buf)} frames, {n_chunks} image chunks).\n")
             except Exception as e:
-                sys.stderr.write(f"[Save] Episode {episode_idx:06d} JSON failed: {e}\n")
+                sys.stderr.write(f"[Save] Episode {episode_idx:02d} JSON failed: {e}\n")
             sys.stderr.flush()
 
         t = threading.Thread(target=_write, daemon=True, name=f"save-ep{episode_idx}")
         self._pending_saves.append(t)
         t.start()
-        sys.stderr.write(f"[Save] Background save started for episode {episode_idx:06d} ({n_chunks} chunks).\n")
+        sys.stderr.write(f"[Save] Background save started for episode {episode_idx:02d} ({n_chunks} chunks).\n")
         sys.stderr.flush()
 
     def discard_episode(self):
-        """Discard current episode on abort/cancel.
+        """Discard current episode on abort/cancel or mid-task reset.
 
         Waits for any in-flight chunk-flush threads, deletes all written files
-        under the episode directory, clears in-memory buffers, and advances
-        episode_idx. The episode folder itself is kept as an abort marker.
+        under the episode directory, clears in-memory buffers. Does NOT advance
+        episode_idx so the next episode reuses the same slot number cleanly.
         """
         ep_idx = self.episode_idx
-        ep_dir = os.path.join(self.session_dir, f"episode_{ep_idx:06d}")
+        ep_dir = os.path.join(self.session_dir, f"episode_{ep_idx:02d}")
 
         # Clear in-memory buffers immediately
         self.param_buffer = []
@@ -792,13 +819,13 @@ class VLNDataLoggerReplicator:
         self.depth_frame_buffer = []
 
         # Wait for in-flight flush threads belonging to this episode
-        prefix = f"flush-ep{ep_idx:06d}-"
+        prefix = f"flush-ep{ep_idx}-"
         ep_threads = [t for t in self._pending_saves if t.name.startswith(prefix)]
         for t in ep_threads:
             t.join(timeout=10.0)
         self._pending_saves = [t for t in self._pending_saves if t.is_alive()]
 
-        # Delete all files, keep the subdirectory structure
+        # Delete all files under the episode directory
         deleted = 0
         for subdir in ("rgb_videos", "depth_videos", "data"):
             subdir_path = os.path.join(ep_dir, subdir)
@@ -813,10 +840,10 @@ class VLNDataLoggerReplicator:
                     sys.stderr.write(f"[Discard] Failed to delete {fpath}: {e}\n")
 
         self._stream_chunk_idx = 0
-        self.episode_idx += 1
+        # Do NOT advance episode_idx — next attempt reuses the same slot
         sys.stderr.write(
-            f"[Discard] Episode {ep_idx:06d} discarded "
-            f"({deleted} file(s) deleted, folder kept).\n"
+            f"[Discard] Episode {ep_idx:02d} discarded "
+            f"({deleted} file(s) deleted). Ready to re-record.\n"
         )
         sys.stderr.flush()
 

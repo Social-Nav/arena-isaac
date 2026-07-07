@@ -7,13 +7,7 @@ Powered by DMXAPI Gemini Video Analysis API
 
 Description:
     Analyzes egocentric robot navigation videos and automatically
-    generates natural language instructions for VLN tasks.
-
-Output modes:
-    - step_by_step        : Decomposed action-by-action instructions
-    - r2r_format          : Room-to-Room dataset compatible instructions
-    - detailed_annotation : Full scene + multi-granularity annotation for training data
-    - JSONL batch export  : Ready-to-use training dataset format
+    generates natural language instructions in R2R (Room-to-Room) format.
 """
 
 import base64
@@ -32,7 +26,9 @@ import requests
 
 MODEL = "gemini-2.5-pro"
 API_URL = f"https://jkwl.dmxapi.cn/v1beta/models/{MODEL}:generateContent"
-API_KEY = "sk-F9c8LBKU5hsuT1lHlNwjuGBRMgE9zwyhTJdFGz4KHKMlt9jJ" # <- replace with your DMXAPI key
+# Read the DMXAPI key from the environment; never hard-code it in source.
+#   export API_KEY=sk-...   (auto-loaded from /opt/arena_ws/.env when sourced)
+API_KEY = os.environ.get("API_KEY", "")
 
 # All paths are anchored to this script's directory, so you can call the
 # script from any working directory and paths will still resolve correctly.
@@ -42,16 +38,12 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 # ========================================
-# VLN Prompt Templates
+# VLN Prompt
 # ========================================
 
-VLN_PROMPTS = {
-
-    "r2r_format": """
+PROMPT = """
 You are an expert VLN dataset annotator familiar with the R2R (Room-to-Room) dataset format.
 Analyze this egocentric robot video and generate navigation instructions that conform to R2R conventions.
-
-Task: Generate R2R-compatible navigation instructions
 
 R2R instruction style requirements:
 - Write in fluent, natural English.
@@ -62,15 +54,9 @@ R2R instruction style requirements:
 
 Output strictly as JSON with no extra text:
 {
-  "instruction": "Full natural-language navigation instruction as a single paragraph in English",
-  "waypoints": ["waypoint 1 description", "waypoint 2 description", "..."],
-  "landmarks": ["landmark 1", "landmark 2", "..."],
-  "environment_type": "indoor / outdoor / mixed",
-  "difficulty": "easy / medium / hard",
-  "distance_estimate": "short / medium / long"
+  "instruction": "Full natural-language navigation instruction as a single paragraph in English"
 }
 """
-}
 
 
 # ========================================
@@ -137,6 +123,9 @@ def call_gemini_api(
         Parsed JSON response dict, or None if all attempts fail.
     """
     headers = {"Content-Type": "application/json"}
+    if not API_KEY:
+        print("  API_KEY not set; export API_KEY=sk-... before running.")
+        return None
     payload = {
         "contents": [{
             "role": "user",
@@ -247,26 +236,19 @@ def print_usage_stats(response: dict):
 
 def analyze_video_for_vln(
     video_path: str,
-    mode: str = "r2r_format",
     save_output: bool = True
 ) -> dict | None:
     """
-    Analyze a single egocentric robot video and generate VLN instructions.
+    Analyze a single egocentric robot video and generate R2R-format VLN instructions.
 
     Path resolution:
         Relative paths are resolved from SCRIPT_DIR (the folder containing
-        this file), NOT from your current working directory. This means you
-        can call the script from anywhere and paths like "test_videos/nav.mp4"
-        will always point to  <vln_generator>/test_videos/nav.mp4.
+        this file), NOT from your current working directory.
 
     Args:
         video_path:  Path to the video file.
                        Relative: "test_videos/nav_01.mp4"  ->  <SCRIPT_DIR>/test_videos/nav_01.mp4
                        Absolute: "/data/robot/nav_01.mp4"  ->  used as-is
-        mode:        Prompt mode. One of:
-                       "r2r_format"          (default, recommended)
-                       "step_by_step"
-                       "detailed_annotation"
         save_output: If True, save the result JSON to OUTPUT_DIR.
 
     Returns:
@@ -279,16 +261,10 @@ def analyze_video_for_vln(
 
     print(f"\n{'='*60}")
     print(f"Video   : {video_path.name}")
-    print(f"Mode    : {mode}")
     print(f"{'='*60}")
 
     if not video_path.exists():
         print(f"File not found: {video_path}")
-        return None
-
-    prompt = VLN_PROMPTS.get(mode)
-    if not prompt:
-        print(f"Unknown mode '{mode}'. Available: {list(VLN_PROMPTS.keys())}")
         return None
 
     print("Encoding video...")
@@ -298,7 +274,7 @@ def analyze_video_for_vln(
 
     mime_type = get_mime_type(str(video_path))
 
-    response = call_gemini_api(video_data, mime_type, prompt)
+    response = call_gemini_api(video_data, mime_type, PROMPT)
     if not response:
         print("API call failed after all retries.")
         return None
@@ -314,7 +290,6 @@ def analyze_video_for_vln(
 
     result = {
         "video_file": video_path.name,
-        "mode": mode,
         "model": MODEL,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "raw_text": text,
@@ -332,7 +307,7 @@ def analyze_video_for_vln(
 
     if save_output:
         stem = video_path.stem
-        out_path = OUTPUT_DIR / f"{stem}_{mode}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        out_path = OUTPUT_DIR / f"{stem}_{time.strftime('%Y%m%d_%H%M%S')}.json"
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         print(f"\nSaved to: {out_path}")
@@ -342,7 +317,6 @@ def analyze_video_for_vln(
 
 def batch_process(
     video_dir: str,
-    mode: str = "r2r_format",
     extensions: list = None,
     output_jsonl: str = None
 ) -> list[dict]:
@@ -352,10 +326,8 @@ def batch_process(
     Args:
         video_dir:    Directory containing video files.
                       Relative paths are resolved from SCRIPT_DIR.
-        mode:         Prompt mode applied to every video.
         extensions:   List of accepted file extensions. Defaults to common video formats.
         output_jsonl: If provided, exports results as a .jsonl file in OUTPUT_DIR.
-                      Useful for directly feeding into VLN model training pipelines.
 
     Returns:
         List of result dicts for all successfully processed videos.
@@ -383,7 +355,7 @@ def batch_process(
 
     for i, video in enumerate(videos, 1):
         print(f"\n[{i}/{len(videos)}] Processing...")
-        result = analyze_video_for_vln(str(video), mode=mode)
+        result = analyze_video_for_vln(str(video))
 
         if result:
             results.append(result)
@@ -425,29 +397,21 @@ def batch_process(
 # ========================================
 
 if __name__ == "__main__":
+    import argparse as _argparse
 
-    print("=" * 60)
-    print("VLN Instruction Generator")
-    print("Powered by DMXAPI Gemini")
-    print("=" * 60)
+    _parser = _argparse.ArgumentParser(description="VLN Instruction Generator")
+    _parser.add_argument("--video", required=True, help="Path to the rgb_video.mp4 to analyze")
+    _parser.add_argument("--tag", default="", help="Session tag used as output filename prefix")
+    _args = _parser.parse_args()
 
-    # ----------------------------------------------------------
-    # Example 1 — Single video, R2R format (recommended)
-    # Place your video at:  vln_generator/test_videos/nav_01.mp4
-    # ----------------------------------------------------------
-    analyze_video_for_vln(
-        video_path="test_videos/hospital_(6xspeed-up).mp4",
-        mode="r2r_format"
+    _result = analyze_video_for_vln(
+        video_path=_args.video,
     )
 
-
-    print("\nQuick start:")
-    print("  1. Set API_KEY at the top of this file.")
-    print("  2. Place your robot video(s) in  vln_generator/test_videos/")
-    print("  3. Uncomment one of the examples above and run:")
-    print("       python vln_generator.py")
-    print("\nAvailable modes:")
-    for m, desc in {
-        "r2r_format":          "R2R-compatible instruction  (recommended for VLN training)",
-    }.items():
-        print(f"  {m:<24} {desc}")
+    # Also write a tag-prefixed copy of the result alongside the video
+    if _result and _args.tag:
+        _video_dir = Path(_args.video).parent
+        _out = _video_dir / f"{_args.tag}_r2r.json"
+        with open(_out, "w", encoding="utf-8") as _f:
+            json.dump(_result, _f, indent=2, ensure_ascii=False)
+        print(f"Tagged result saved to: {_out}")

@@ -126,6 +126,7 @@ define_prim("/World/Pedestrians", "Xform")
 extensions.enable_extension("isaacsim.ros2.bridge")
 extensions.enable_extension("isaacsim.sensors.physics")
 extensions.enable_extension("isaacsim.sensors.camera")
+extensions.enable_extension("isaacsim.sensors.rtx")
 
 import numpy as np
 
@@ -307,6 +308,7 @@ class IsaacController(rclpy.node.Node):
         super().__init__(node_name="isaac", *args, **kwargs)
         self._running = False
         self._should_step_once = False
+        self._capture_requested = False
 
         self.__pause_srv = self.create_service(
             std_srvs.srv.Trigger,
@@ -323,14 +325,50 @@ class IsaacController(rclpy.node.Node):
             os.path.join('isaac/StepSimulation'),
             self._cb_step,
         )
+        self.__capture_srv = self.create_service(
+            std_srvs.srv.Trigger,
+            os.path.join('isaac/CaptureSnapshot'),
+            self._cb_capture,
+        )
+
+        # Publish sim running state (latched) so external nodes — e.g. the
+        # proactive-yielding trigger — can react to pause/unpause transitions.
+        from rclpy.qos import QoSProfile, DurabilityPolicy
+        _state_qos = QoSProfile(depth=1)
+        _state_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.__running_pub = self.create_publisher(
+            std_msgs.msg.Bool, 'isaac/sim_running', _state_qos)
+        self._publish_running_state()
+
+        # Publish "snapshot finished, dir=<path>" so the social-replan
+        # orchestrator can pick it up (select goal -> reproject -> unpause).
+        self.__snapshot_ready_pub = self.create_publisher(
+            std_msgs.msg.String, 'isaac/snapshot_ready', 10)
+
+    def _publish_running_state(self):
+        try:
+            self.__running_pub.publish(std_msgs.msg.Bool(data=bool(self._running)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def publish_snapshot_ready(self, out_dir: str):
+        try:
+            self.__snapshot_ready_pub.publish(std_msgs.msg.String(data=str(out_dir)))
+            self.get_logger().info(f"Published snapshot_ready: {out_dir}")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _cb_pause(self, request: std_srvs.srv.Trigger.Request, response: std_srvs.srv.Trigger.Response):
         self._running = False
+        self._publish_running_state()
+        self.get_logger().info("Simulation PAUSED (external request)")
         response.success = True
         return response
 
     def _cb_unpause(self, request: std_srvs.srv.Trigger.Request, response: std_srvs.srv.Trigger.Response):
         self._running = True
+        self._publish_running_state()
+        self.get_logger().info("Simulation UNPAUSED (external request)")
         response.success = True
         return response
 
@@ -338,6 +376,22 @@ class IsaacController(rclpy.node.Node):
         self._should_step_once = True
         response.success = True
         return response
+
+    def _cb_capture(self, request: std_srvs.srv.Trigger.Request, response: std_srvs.srv.Trigger.Response):
+        # Method A: only raise the flag. The main loop performs the actual
+        # capture while the sim is paused (render context lives there).
+        self._capture_requested = True
+        self.get_logger().info("Snapshot requested (queued for paused main loop)")
+        response.success = True
+        response.message = "queued"
+        return response
+
+    @property
+    def capture_requested(self) -> bool:
+        return self._capture_requested
+
+    def clear_capture_request(self):
+        self._capture_requested = False
 
     @property
     def _step_once(self) -> bool:
@@ -363,14 +417,14 @@ class IsaacController(rclpy.node.Node):
 
 
 # ======================================main=======================================
-from vln_dataset_logger_replicator import VLNDataLoggerReplicator
+from arena_isaac.data_logging.data_logger_replicator import DataLoggerReplicator
 import signal
 
 
-def _resolve_vln_dataset_logger_prim_paths(robot_model: str) -> tuple[str, str, str] | None:
-    """Read VLN logger USD prim paths from arena_robots/robots/<model>/model_params.yaml.
+def _resolve_data_logger_prim_paths(robot_model: str) -> tuple[str, str, str] | None:
+    """Read data logger USD prim paths from arena_robots/robots/<model>/model_params.yaml.
 
-    Expected YAML block (optional): ``vln_dataset_logger`` with keys:
+    Expected YAML block (optional): ``data_logger`` with keys:
       - robot_stage_name: last segment under /World/Robots/ (e.g. robot0 or Ai2_Bot2)
       - camera_prim_suffix: path under that robot prim to the Camera prim
       - lidar_prim_suffix: path under that robot prim to the lidar link prim
@@ -396,21 +450,100 @@ def _resolve_vln_dataset_logger_prim_paths(robot_model: str) -> tuple[str, str, 
     if not isinstance(data, dict):
         return None
 
-    vln = data.get('vln_dataset_logger')
-    if not isinstance(vln, dict):
+    logger_cfg = data.get('data_logger')
+    if not isinstance(logger_cfg, dict):
         return None
 
-    stage = vln.get('robot_stage_name')
-    cam_suffix = vln.get('camera_prim_suffix')
-    lidar_suffix = vln.get('lidar_prim_suffix')
+    stage = logger_cfg.get('robot_stage_name')
+    cam_suffix = logger_cfg.get('camera_prim_suffix')
+    lidar_suffix = logger_cfg.get('lidar_prim_suffix')
     if not stage or not cam_suffix or not lidar_suffix:
         return None
 
     root = os.path.join('/World', 'Robots', str(stage))
     lidar_path = os.path.join(root, str(lidar_suffix))
     camera_path = os.path.join(root, str(cam_suffix))
-    ped_root = str(vln.get('pedestrian_root_path') or '/World/Pedestrians')
+    ped_root = str(logger_cfg.get('pedestrian_root_path') or '/World/Pedestrians')
     return lidar_path, camera_path, ped_root
+
+
+def _resolve_snapshot_config(robot_model: str) -> dict | None:
+    """Read the ``snapshot`` block from arena_robots/robots/<model>/model_params.yaml.
+
+    Expected YAML block (optional): ``snapshot`` with keys:
+      - head_camera_suffix / back_camera_suffix: path under /World/Robots/<stage>
+        to each Camera prim (either may be omitted → that view is skipped)
+      - topdown_half_extent: half side length (m) the top-down view covers
+      - topdown_height: camera height (m) above the robot
+
+    ``robot_stage_name`` is reused from the ``data_logger`` block so the
+    robot root path stays consistent. Returns a dict with resolved absolute
+    prim paths and top-down params, or None if unset/incomplete.
+    """
+    try:
+        from ament_index_python.packages import get_package_share_path
+    except Exception:
+        return None
+
+    yaml_path = get_package_share_path('arena_robots') / 'robots' / robot_model / 'model_params.yaml'
+    if not yaml_path.is_file():
+        return None
+
+    try:
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    snap = data.get('snapshot')
+    if not isinstance(snap, dict):
+        return None
+
+    logger_cfg = data.get('data_logger') or {}
+    stage = snap.get('robot_stage_name') or logger_cfg.get('robot_stage_name')
+    if not stage:
+        return None
+
+    root = os.path.join('/World', 'Robots', str(stage))
+    head_suffix = snap.get('head_camera_suffix')
+    back_suffix = snap.get('back_camera_suffix')
+    # base_link tracks the robot as it moves (the root Xform stays at spawn).
+    # Fall back to deriving it from the lidar suffix (drop the trailing link).
+    base_suffix = snap.get('base_link_suffix')
+    if not base_suffix:
+        lidar_suffix = logger_cfg.get('lidar_prim_suffix')
+        if lidar_suffix:
+            base_suffix = str(lidar_suffix).rsplit('/', 1)[0]  # drop /lidar_link
+    return {
+        'robot_root_path': root,
+        'base_link_path': os.path.join(root, str(base_suffix)) if base_suffix else root,
+        'head_camera_path': os.path.join(root, str(head_suffix)) if head_suffix else '',
+        'back_camera_path': os.path.join(root, str(back_suffix)) if back_suffix else '',
+        'topdown_half_extent': float(snap.get('topdown_half_extent', 5.0)),
+        'topdown_height': float(snap.get('topdown_height', 8.0)),
+    }
+
+
+def _get_prim_world_position(prim_path: str) -> tuple[float, float, float]:
+    """Return the world-space (x, y, z) translation of a prim.
+
+    Uses the batched XformPrim API (same one the data logger uses for
+    pedestrians). Falls back to (0, 0, 0) on failure.
+    """
+    try:
+        try:
+            from isaacsim.core.experimental.prims import XformPrim as XFormPrim
+        except ImportError:
+            from omni.isaac.core.prims import XFormPrim
+        positions, _ = XFormPrim(prim_path).get_world_poses()
+        p = positions.numpy()[0]
+        return float(p[0]), float(p[1]), float(p[2])
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(f"[Snapshot] world position lookup failed for {prim_path}: {e}\n")
+        return 0.0, 0.0, 0.0
 
 
 def main(args=None):
@@ -420,57 +553,74 @@ def main(args=None):
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('--save-data', type=str, default='false',
-                       help='Enable VLN dataset logging')
+                       help='Enable dataset logging')
     parser.add_argument('--robot', type=str, default='jackal',
                        help='Robot name used in task_generator topic namespace')
     parser.add_argument('--log-level', type=str, default='info',
                        help='log level for IsaacSim (debug/info/warn/error)')
+    parser.add_argument('--session-tag', type=str, default='',
+                       help='Label prepended to the session directory, e.g. grscenes_1__default')
     parsed_args = parser.parse_args(args)
 
     enable_logging = parsed_args.save_data.lower() == 'true'
     robot_name = parsed_args.robot
-    vln_logger_replicator_cls = None
-    # vln_logger_rosbag_cls = None
+    session_tag = parsed_args.session_tag
+    data_logger_replicator_cls = None
+    # data_logger_rosbag_cls = None
 
-    vln_paths = _resolve_vln_dataset_logger_prim_paths(robot_name)
-    if vln_paths is None:
+    data_logger_paths = _resolve_data_logger_prim_paths(robot_name)
+    if data_logger_paths is None:
         target_lidar_path = ""
         target_camera_path = ""
         target_pedestrian_root_path = "/World/Pedestrians"
     else:
-        target_lidar_path, target_camera_path, target_pedestrian_root_path = vln_paths
+        target_lidar_path, target_camera_path, target_pedestrian_root_path = data_logger_paths
 
-    if enable_logging and vln_paths is None:
+    if enable_logging and data_logger_paths is None:
         enable_logging = False
         sys.stderr.write(
-            "[WARN] VLN logging disabled: missing or incomplete "
-            f"'vln_dataset_logger' in arena_robots/robots/{robot_name}/model_params.yaml "
+            "[WARN] Data logging disabled: missing or incomplete "
+            f"'data_logger' in arena_robots/robots/{robot_name}/model_params.yaml "
             "(need robot_stage_name, camera_prim_suffix, lidar_prim_suffix).\n"
         )
         sys.stderr.flush()
     
-    # VLN logger state
+    # data logger state
     logger = None
     frame_step_counter = 0
     has_saved = False
     collecting = False   # True only while robot is actively executing a task
-    
+
+    # Snapshot capturer state (proactive-yielding trigger → paused → capture).
+    # Lazily created on first capture request; needs the robot to be spawned.
+    snapshot_capturer = None
+    snapshot_config = _resolve_snapshot_config(robot_name)
+
+    def _snapshot_output_root():
+        """Base dir for snapshots/, mirroring the data logger output layout."""
+        _p = Path(__file__).resolve()
+        while _p.name != 'Arena' and _p.parent != _p:
+            _p = _p.parent
+        base = _p / 'collected_data'
+        return str(base / session_tag) if session_tag else str(base)
+
+
     if enable_logging:
         try:
-            from vln_dataset_logger_replicator import VLNDataLoggerReplicator
-            # from vln_dataset_logger_rosbag import VLNDataLoggerRosbag
+            from arena_isaac.data_logging.data_logger_replicator import DataLoggerReplicator
+            # from arena_isaac.data_logging.data_logger_rosbag import DataLoggerRosbag
 
-            vln_logger_replicator_cls = VLNDataLoggerReplicator
-            # vln_logger_rosbag_cls = VLNDataLoggerRosbag
+            data_logger_replicator_cls = DataLoggerReplicator
+            # data_logger_rosbag_cls = DataLoggerRosbag
             sys.stderr.write(
-                "[INFO] VLN logging modules loaded successfully.\n"
+                "[INFO] Data logging modules loaded successfully.\n"
             )
             sys.stderr.flush()
 
         except Exception as e:
             enable_logging = False
             sys.stderr.write(
-                f"[WARN] VLN logging disabled because optional dependencies are unavailable: {e}\n"
+                f"[WARN] Data logging disabled because optional dependencies are unavailable: {e}\n"
             )
             sys.stderr.flush()
 
@@ -500,13 +650,15 @@ def main(args=None):
 
         def _start_episode():
             nonlocal collecting, frame_step_counter
-            # Save leftover buffer if robot was interrupted mid-task
-            if len(logger.param_buffer) > 0:
-                sys.stderr.write(f"[TaskReset #{episode_num}] Saving interrupted episode ({len(logger.param_buffer)} frames)...\n")
+            # Discard leftover buffer if robot was interrupted mid-task (no save signal received)
+            if collecting or len(logger.param_buffer) > 0:
+                sys.stderr.write(f"[TaskReset #{episode_num}] Discarding incomplete episode ({len(logger.param_buffer)} frames)...\n")
                 try:
-                    logger.save_episode()
+                    logger.discard_episode()
                 except Exception as e:
-                    sys.stderr.write(f"[TaskReset #{episode_num}] Save failed: {e}\n")
+                    sys.stderr.write(f"[TaskReset #{episode_num}] Discard failed: {e}\n")
+            # Clear stale pedestrian prims — they are deleted/respawned on reset
+            logger.pedestrian_prims = []
             frame_step_counter = 0
             collecting = True
             sys.stderr.write(f"[TaskReset #{episode_num}] Episode started, collecting data.\n")
@@ -550,7 +702,9 @@ def main(args=None):
             sys.stderr.write(f"[NavStatus {label}] Saving episode ({len(logger.param_buffer)} frames)...\n")
             try:
                 logger.save_episode()
+                logger.wait_for_pending_saves(timeout=120.0)
                 sys.stderr.write(f"[NavStatus {label}] Save complete.\n")
+                _pub_episode_saved.publish(std_msgs.msg.Empty())
             except Exception as e:
                 sys.stderr.write(f"[NavStatus {label}] Save failed: {e}\n")
             sys.stderr.flush()
@@ -586,6 +740,9 @@ def main(args=None):
         _on_nav_status, 1)
     controller.create_subscription(
         std_msgs.msg.Empty, '/task_generator_node/finished', _on_finished, 10)
+
+    _pub_episode_saved = controller.create_publisher(
+        std_msgs.msg.Empty, '/data_logger/episode_saved', 10)
 
     door_manager = DoorManager.instance(controller)
     elevator_manager.register_node(controller)  # Register controller for odom subscriptions
@@ -662,8 +819,11 @@ def main(args=None):
                                     _p = Path(__file__).resolve()
                                     while _p.name != 'Arena' and _p.parent != _p:
                                         _p = _p.parent
-                                    _output_dir = str(_p / 'collected_data')
-                                    logger = vln_logger_replicator_cls(
+                                    if session_tag:
+                                        _output_dir = str(_p / 'collected_data' / session_tag)
+                                    else:
+                                        _output_dir = str(_p / 'collected_data')
+                                    logger = data_logger_replicator_cls(
                                         camera_prim_path=target_camera_path,
                                         pedestrian_root_path=target_pedestrian_root_path,
                                         lidar_prim_path=target_lidar_path,
@@ -671,7 +831,7 @@ def main(args=None):
                                     )
                                     sys.stderr.write(f"\n [Logger] Output dir: {_output_dir}\n")
                                     '''
-                                    logger = vln_logger_rosbag_cls(
+                                    logger = data_logger_rosbag_cls(
                                         topics=[
                                             "/task_generator_node/jackal/odom",
                                             "/task_generator_node/jackal/front_camera/camera_info",
@@ -689,7 +849,7 @@ def main(args=None):
                                     controller.get_logger().info('Rosbag Logger initialized successfully')
                                     '''
                                 except Exception as e:
-                                    sys.stderr.write(f"\n VLNDataLogger initialization failed: {e}\n")
+                                    sys.stderr.write(f"\n DataLogger initialization failed: {e}\n")
                             elif frame_step_counter % 300 == 0:
                                 sys.stderr.write(f" Waiting for robot spawn... searching path: {target_camera_path}\n")
                     else:
@@ -708,6 +868,69 @@ def main(args=None):
                     world.pause()
                     was_playing = False
                 simulation_app.update()
+
+                # Snapshot capture: only while genuinely paused (this branch),
+                # so images are of a frozen scene, never a moving one. The ROS
+                # service just raised the flag; the real work happens here where
+                # the render context lives.
+                if controller.capture_requested:
+                    try:
+                        sys.stderr.write("[Snapshot] === capture start (paused main loop) ===\n")
+                        if snapshot_config is None:
+                            sys.stderr.write(
+                                "[Snapshot] ABORT: no 'snapshot' block in model_params.yaml "
+                                f"for robot '{robot_name}'.\n")
+                        else:
+                            robot_root = snapshot_config['robot_root_path']
+                            sys.stderr.write(
+                                f"[Snapshot] step A: checking robot prim {robot_root}\n")
+                            if not is_prim_path_valid(robot_root):
+                                sys.stderr.write(
+                                    f"[Snapshot] ABORT: robot not spawned yet ({robot_root}).\n")
+                            else:
+                                if snapshot_capturer is None:
+                                    from arena_isaac.social_yielding.snapshot_capturer import SnapshotCapturer
+                                    snapshot_capturer = SnapshotCapturer(
+                                        output_root=_snapshot_output_root(),
+                                        simulation_app=simulation_app,
+                                    )
+                                    sys.stderr.write(
+                                        f"[Snapshot] step B: capturer created, "
+                                        f"output_root={_snapshot_output_root()}\n")
+                                # Center the top-down on the robot's CURRENT pose.
+                                # The root Xform stays frozen at spawn, so use
+                                # base_link which moves with the articulation.
+                                base_link_path = snapshot_config.get('base_link_path') or robot_root
+                                robot_pos = _get_prim_world_position(base_link_path)
+                                sys.stderr.write(
+                                    f"[Snapshot] step C: robot base_link world pos="
+                                    f"({robot_pos[0]:.2f}, {robot_pos[1]:.2f}, {robot_pos[2]:.2f}) "
+                                    f"from {base_link_path}\n")
+                                sys.stderr.write(
+                                    "[Snapshot] step D: calling capture() "
+                                    f"(head={snapshot_config['head_camera_path']}, "
+                                    f"back={snapshot_config['back_camera_path']})\n")
+                                sys.stderr.flush()
+                                ok, out_dir = snapshot_capturer.capture(
+                                    robot_position=robot_pos,
+                                    head_cam_path=snapshot_config['head_camera_path'],
+                                    back_cam_path=snapshot_config['back_camera_path'],
+                                    topdown_half_extent=snapshot_config['topdown_half_extent'],
+                                    topdown_height=snapshot_config['topdown_height'],
+                                )
+                                if ok:
+                                    sys.stderr.write(f"[Snapshot] 截图已保存 -> {out_dir}\n")
+                                    # Notify the social-replan orchestrator.
+                                    controller.publish_snapshot_ready(out_dir)
+                                else:
+                                    sys.stderr.write("[Snapshot] 截图失败（无有效视图）\n")
+                    except Exception as e:
+                        sys.stderr.write(f"[Snapshot] capture crashed: {e}\n")
+                        traceback.print_exc(file=sys.stderr)
+                    finally:
+                        controller.clear_capture_request()
+                        sys.stderr.write("[Snapshot] === capture end ===\n")
+                        sys.stderr.flush()
 
             if stepped_this_iteration:
                 pending_actions = run_after_tick_queue.qsize()
