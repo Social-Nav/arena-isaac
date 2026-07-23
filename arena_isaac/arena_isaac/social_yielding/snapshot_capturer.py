@@ -101,6 +101,15 @@ class SnapshotCapturer:
                         f"[Snapshot] {tag} camera path invalid, skipping: {cam_path}\n")
                     continue
                 rp = rep.create.render_product(cam_path, _HEAD_BACK_RES)
+                # Isaac 5.1: a freshly created render product is lazy — its hydra
+                # texture / OmniGraph nodes are not built until the app pumps
+                # frames. Attaching an annotator immediately fails inside
+                # activate_node_template ("Annotator rgb is not attached to any
+                # render products"), and this got worse once the back camera added
+                # a second resident SDG pipeline. Pump several updates so the RP is
+                # real before attaching (one update was not enough).
+                for _ in range(_WARMUP_STEPS):
+                    self._app.update()
                 rgb_a = rep.AnnotatorRegistry.get_annotator("rgb")
                 depth_a = rep.AnnotatorRegistry.get_annotator("distance_to_camera")
                 # camera_params gives the SAME-FRAME view/projection matrices, so
@@ -259,6 +268,11 @@ class SnapshotCapturer:
                 f"[Snapshot] topdown: world_pos={cam_world_pos}, rotation=identity (look -Z / down)\n")
 
             rp = rep.create.render_product(cam_path, _TOPDOWN_RES)
+            # Isaac 5.1: pump several frames so the lazily-created render product
+            # is real before attaching the annotator (see head/back path; one
+            # frame was not enough with the back camera's SDG pipeline resident).
+            for _ in range(_WARMUP_STEPS):
+                self._app.update()
             rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
             rgb_annot.attach(rp)
             sys.stderr.write(

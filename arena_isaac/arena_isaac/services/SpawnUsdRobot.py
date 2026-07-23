@@ -407,9 +407,21 @@ def _remap_namespace(prim_path: str, namespace: str, base_frame: str | None = No
                     )
                     continue
                 try:
-                    attr.Set(namespace)
+                    # Preserve any existing per-node namespace (e.g. a camera's
+                    # "back_camera" / "chassis_camera") by nesting it UNDER the
+                    # robot namespace, instead of overwriting it. Two cameras that
+                    # publish the same topicName (e.g. "/depth_pcl") would collide
+                    # on one topic if we flattened them to the same namespace;
+                    # keeping their sub-namespace yields distinct topics
+                    # (.../back_camera/depth_pcl vs .../chassis_camera/depth_pcl).
+                    old_ns = attr.Get()
+                    if old_ns is None:
+                        old_ns = _get_og_attr_value(prim_path_str, attr_name)
+                    old_ns = str(old_ns).strip().strip('/') if old_ns is not None else ''
+                    new_ns = f"{namespace}/{old_ns}" if old_ns else namespace
+                    attr.Set(new_ns)
                     carb.log_warn(
-                        f"[SpawnUsdRobot] Set {attr_name}='{namespace}' "
+                        f"[SpawnUsdRobot] Set {attr_name}='{new_ns}' "
                         f"on {prim_path_str}"
                     )
                     remapped_count += 1
