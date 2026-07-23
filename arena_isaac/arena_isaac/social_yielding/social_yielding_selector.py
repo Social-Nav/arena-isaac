@@ -83,35 +83,63 @@ You are given three images from the robot at the moment of conflict:
     about where the pedestrian(s) are relative to the robot and which direction
     has enough open floor to actually step aside / retreat into.
 
-Reasoning steps:
-  1. From the topdown, locate the pedestrian(s) and the robot (image centre), and
-     identify the direction with the most open, drivable floor to yield into.
-  2. Choose the ego camera ("head" or "back") that looks toward that open
+Reasoning steps (do them IN ORDER):
+  1. DIRECTION (use topdown only as a hint): from the topdown, locate the
+     pedestrian(s) and the robot (image centre) and note which side has the most
+     open floor to yield into. The topdown is only an auxiliary hint for
+     direction — the actual goal pixel MUST be chosen in an ego image, not here.
+  2. CAMERA: choose the ego camera ("head" or "back") that looks toward that open
      direction. Front is usually blocked, so it is often "back".
-  3. In that ego image, pick ONE pixel goal (u, v) on the open floor that is:
-     - clearly FURTHER away, not just in front of the robot — aim for a spot that
-       is several metres away (roughly the mid-to-far floor region of the image,
-       i.e. a point noticeably above the very bottom edge), so the robot actually
-       vacates the corridor;
-     - still on visible, reachable floor — NOT on a wall, furniture, person, or
-       the far horizon/ceiling (those give unreliable depth). A good target sits
-       on the floor plane, mid-height in the image.
+  3. SEGMENT the chosen ego image FIRST, before picking any point. Mentally label
+     every region as one of: DRIVABLE FLOOR (the continuous ground plane the robot
+     could roll over), or NON-DRIVABLE (walls, furniture, people, doors, steps,
+     the far horizon/ceiling, and anything whose depth is unreliable). Then list
+     the drivable-floor regions you found in "floor_regions" (see schema), each as
+     a rough box [u_min, v_min, u_max, v_max] with a short label.
+  4. SELECT a point INSIDE the largest / most open drivable-floor region:
+     - Put it near the CENTRE of that floor region, not at its edge, so there is
+       floor margin on all sides (not hugging a wall or a floor–wall boundary).
+     - Ground-continuity test (must hold): from the chosen pixel straight DOWN to
+       the bottom edge of the image, every pixel is still floor — the path to the
+       robot's feet is unbroken ground. If a wall / object / skirting interrupts
+       that vertical strip, the point is on a wall base, not reachable floor —
+       reject it and pick a point lower in the image where the strip is clean.
+     - It should genuinely open space to yield into (not right at the robot's
+       feet), but stay well within the drivable region (not at the far edge where
+       floor meets wall and depth is unreliable).
 
 Coordinate convention:
   - u = horizontal pixel, 0 = left edge, increasing right.
   - v = vertical pixel, 0 = top edge, increasing down.
-  - (u, v) MUST lie inside the chosen image's resolution.
-  - Balance: far enough to truly yield, but on solid visible floor (not a wall/far
-    background) so the 3D position is reliable.
+  - (u, v) MUST lie inside the chosen image's resolution and inside one of the
+    floor_regions you listed.
 
 Output STRICTLY as JSON, no extra text:
 {{
   "camera": "head" | "back",
+  "floor_regions": [
+    {{"box": [u_min, v_min, u_max, v_max], "label": "e.g. open floor to the left"}}
+  ],
   "pixel_goal": [u, v],
+  "ground_continuous_below": true,
   "reason": "one concise sentence: where the pedestrian is and why this yields",
   "confidence": 0.0-1.0
 }}
-"""
+{feedback}"""
+
+
+# Appended to the prompt on a retry, listing previously-rejected goals so the model
+# picks a DIFFERENT spot (the earlier ones reprojected onto a wall/obstacle).
+FEEDBACK_TEMPLATE = """
+
+IMPORTANT — previous attempt(s) were REJECTED: the chosen pixel reprojected onto a
+WALL or OBSTACLE (not reachable floor). That means your floor segmentation was too
+generous there. Re-segment more conservatively and choose a clearly DIFFERENT
+pixel: move it LOWER (closer to the robot's feet, where ground is more certain)
+and MORE CENTRAL within an open floor region — away from the floor–wall boundary
+by a bigger margin. Consider the other camera if this side has little real floor.
+Do NOT reuse any of these rejected pixels:
+{rejected_list}"""
 
 
 # ========================================
@@ -297,6 +325,7 @@ def annotate_pixel_goal(
 def select_yielding_goal(
     snapshot_dir: str,
     save_output: bool = True,
+    rejected: list | None = None,
 ) -> dict | None:
     """
     Pick a yielding pixel goal from a snapshot directory (head/back/topdown).
@@ -305,6 +334,9 @@ def select_yielding_goal(
         snapshot_dir: dir containing head_rgb.png / back_rgb.png / topdown_rgb.png.
                       Relative paths resolve from SCRIPT_DIR.
         save_output:  if True, save result JSON + annotated ego image.
+        rejected:     optional list of previously-rejected goals to avoid, each a dict
+                      {camera, pixel:[u,v], reason}. Fed back into the prompt so the
+                      model picks a DIFFERENT spot on the next attempt.
 
     Returns:
         Result dict {camera, pixel_goal, reason, confidence, annotated_image, ...}
@@ -334,8 +366,19 @@ def select_yielding_goal(
 
     head_w, head_h = sizes.get("head", (0, 0))
     back_w, back_h = sizes.get("back", (0, 0))
+
+    feedback = ""
+    if rejected:
+        rejected_list = "\n".join(
+            f"  - camera={r.get('camera')}, pixel={r.get('pixel')}"
+            f"{(' (' + r['reason'] + ')') if r.get('reason') else ''}"
+            for r in rejected
+        )
+        feedback = FEEDBACK_TEMPLATE.format(rejected_list=rejected_list)
+
     prompt = PROMPT_TEMPLATE.format(
         head_w=head_w, head_h=head_h, back_w=back_w, back_h=back_h,
+        feedback=feedback,
     )
 
     response = call_vision_api(images_uri, prompt)
