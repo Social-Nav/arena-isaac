@@ -4,6 +4,7 @@ import time
 
 from omni.isaac.core import World
 from pedestrian.simulator.logic.people.person import Person
+from pedestrian.simulator.logic.people.rendered_state_backend import make_backend_if_enabled
 from pedestrian.simulator.logic.people_manager import PeopleManager
 
 from isaac_utils.utils.path import world_path
@@ -40,10 +41,17 @@ def spawn_pedestrian(pedestrian: Pedestrian) -> bool:
     # Destroying the old Person first cleanly removes its callbacks and USD prim.
     PeopleManager.get_people_manager().remove_person(usd_path)  # no-op on first spawn
 
+    # The backend makes the RENDERED pose observable.  Person.update_state() already reads it out of
+    # the animation graph every physics step; without a backend it was thrown away, which is why a
+    # divergence between the rendered pedestrian and the logical track the evaluation grades against
+    # left no artifact and raised no error.
+    backend = make_backend_if_enabled()
+
     if not pedestrian.controller_stats:
-        Person(world, usd_path, pedestrian.character_name, position, orientation)
+        Person(world, usd_path, pedestrian.character_name, position, orientation, backend=backend)
     else:
-        Person(world, usd_path, pedestrian.character_name, position, orientation, pedestrian.controller_name)
+        Person(world, usd_path, pedestrian.character_name, position, orientation,
+               pedestrian.controller_name, backend=backend)
 
     if _LOGGER is not None:
         _LOGGER.warn(f"[SpawnPedestrians] spawned {pedestrian.name} in {time.monotonic() - started:.3f}s")

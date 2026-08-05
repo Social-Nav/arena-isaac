@@ -11,10 +11,18 @@ from isaacsim_msgs.msg import PedestrianGoal
 from isaacsim_msgs.srv import NavigatePedestrians
 
 from .utils import Service, on_exception
+from pedestrian.simulator.logic.people.pedestrian_targeting import (
+    ARRIVAL_DEAD_BAND_M,
+    DEFAULT_WALK_SPEED_MPS,
+    LOOK_AHEAD_M,
+    MIN_WALK_SPEED_MPS,
+    plan_pedestrian_target,
+)
 
-_LOOK_AHEAD_M = 2.0
-_DEFAULT_WALK_SPEED_MPS = 0.8
-_MIN_WALK_SPEED_MPS = 0.05
+_LOOK_AHEAD_M = LOOK_AHEAD_M
+_DEFAULT_WALK_SPEED_MPS = DEFAULT_WALK_SPEED_MPS
+_MIN_WALK_SPEED_MPS = MIN_WALK_SPEED_MPS
+_ARRIVAL_DEAD_BAND_M = ARRIVAL_DEAD_BAND_M
 _LOG_PERIOD_SEC = 5.0
 _LAST_LOG_TIME_BY_KEY: dict[str, float] = {}
 
@@ -77,21 +85,24 @@ def navigate_pedestrian(goal: PedestrianGoal) -> bool:
     hunav_pos = np.array([goal.position.x, goal.position.y, goal.position.z])
     current_pos = np.array(person.state.position, dtype=float)  # updated by Person.update_state() every physics step
 
-    direction = hunav_pos - current_pos
-    dist = np.linalg.norm(direction)
+    plan = plan_pedestrian_target(
+        current_pos,
+        hunav_pos,
+        getattr(goal, 'velocity', 0.0),
+        look_ahead_m=_LOOK_AHEAD_M,
+        dead_band_m=_ARRIVAL_DEAD_BAND_M,
+        default_walk_speed=_DEFAULT_WALK_SPEED_MPS,
+        min_walk_speed=_MIN_WALK_SPEED_MPS,
+    )
 
-    if dist < 0.01:
-        # Essentially stationary: clear queue so character idles
+    if plan is None:
+        # Within the arrival dead band: clear the queue so the character idles.  Chasing a
+        # sub-dead-band residual used to project a full 2.0 m walk from direction noise.
         person._target_positions.clear()
         return True
 
-    # Project _LOOK_AHEAD_M ahead in the hunav direction so the waypoint is
-    # always beyond Person.update()'s 0.3 m pop-threshold.
-    unit = direction / dist
-    far_target = current_pos + unit * _LOOK_AHEAD_M
-
-    requested_speed = float(getattr(goal, 'velocity', 0.0) or 0.0)
-    walk_speed = requested_speed if requested_speed >= _MIN_WALK_SPEED_MPS else _DEFAULT_WALK_SPEED_MPS
+    far_target = plan.target
+    walk_speed = plan.walk_speed
     person._target_positions.clear()
     person.update_target_positions(
         [[float(far_target[0]), float(far_target[1]), float(far_target[2])]],
@@ -103,7 +114,7 @@ def navigate_pedestrian(goal: PedestrianGoal) -> bool:
         f"current=({current_pos[0]:.3f}, {current_pos[1]:.3f}, {current_pos[2]:.3f}) "
         f"hunav=({hunav_pos[0]:.3f}, {hunav_pos[1]:.3f}, {hunav_pos[2]:.3f}) "
         f"far=({far_target[0]:.3f}, {far_target[1]:.3f}, {far_target[2]:.3f}) "
-        f"speed={walk_speed:.3f}",
+        f"residual={plan.residual_m:.3f} speed={walk_speed:.3f}",
     )
     return True
 
