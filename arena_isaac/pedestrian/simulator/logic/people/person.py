@@ -1,5 +1,6 @@
 # Low level APIs
 import os
+import time
 from collections import deque
 
 import carb
@@ -15,6 +16,14 @@ from omni.usd import get_stage_next_free_path
 from pxr import Gf, Sdf
 from scipy.spatial.transform import Rotation
 
+from pedestrian.simulator.logic.people.animation_clock import (
+    AnimationGraphAcquisition,
+    AnimationTickHealth,
+    MANUAL_TICK_ENV_VAR,
+    animation_tick_dt,
+    manual_tick_disabled_message,
+    manual_tick_enabled,
+)
 from pedestrian.simulator.logic.people.person_controller import PersonController
 from pedestrian.simulator.logic.people_manager import PeopleManager
 
@@ -77,6 +86,16 @@ class Person:
         self._target_positions = deque[np.ndarray]()
         self._target_speed = 0.0
 
+        # Animation-graph state.  These must exist before the physics callbacks below are
+        # registered: both callbacks reach for `character_graph` on their very first invocation.
+        self._character_graph = None
+        self._anim_acquisition = AnimationGraphAcquisition()
+        self._anim_tick_enabled = manual_tick_enabled()
+        self._anim_tick_health = AnimationTickHealth()
+        self._anim_tick_broken_reported = False
+        if not self._anim_tick_enabled:
+            carb.log_warn(manual_tick_disabled_message())
+
         # Save the name with which the vehicle will appear in the stage
         # and the character model that will be loaded into the simulator
         self._stage_prefix = stage_prefix
@@ -116,19 +135,44 @@ class Person:
         if not self._world.timeline_callback_exists(cb_path := self._stage_prefix + "/start_stop_sim"):
             self._world.add_timeline_callback(cb_path, self.sim_start_stop)
 
-        self._character_graph = None
-
     @property
     def character_graph(self):
         """The animation graph of the person.
 
         Returns:
-            CharacterGraph: The animation graph of the person.
+            CharacterGraph: The animation graph of the person, or None while it cannot be acquired.
         """
         if self._character_graph is None:
-            self.add_animation_graph_to_agent()
-            self._character_graph = ag.get_character(self.character_skel_root_stage_path)
+            self._acquire_character_graph()
         return self._character_graph
+
+    def _acquire_character_graph(self):
+        """Try once to acquire the animation graph, throttling USD authoring and never failing quietly.
+
+        The animation graph is the only transport that moves a rendered pedestrian, so a permanent
+        failure here freezes every pedestrian.  Before this method existed the property simply
+        returned None, both physics callbacks returned early, and the run reported nothing at all.
+        """
+        now = time.monotonic()
+        action = self._anim_acquisition.next_action(now)
+        if action == "author":
+            try:
+                self.add_animation_graph_to_agent()
+            except Exception as exc:
+                carb.log_warn(
+                    f"[PedestrianAnimation] applying the AnimationGraphAPI to "
+                    f"{self.character_skel_root_stage_path} raised {exc!r}; will retry"
+                )
+        graph = ag.get_character(self.character_skel_root_stage_path)
+        if graph:
+            self._character_graph = graph
+            carb.log_warn(self._anim_acquisition.success_message(
+                now, self.character_skel_root_stage_path))
+            return
+        message = self._anim_acquisition.failure_message(
+            now, self.character_skel_root_stage_path)
+        if message:
+            carb.log_error(message)
 
     @property
     def state(self):
@@ -198,11 +242,19 @@ class Person:
             self.character_graph.set_variable("PathPoints", [carb.Float3(self._state.position), carb.Float3(extended_target)])
             self.character_graph.set_variable("Action", "Walk")
             self.character_graph.set_variable("Walk", self._target_speed)
+            commanded_speed = float(self._target_speed)
 
         else:
             # at target position, stop moving
             self.character_graph.set_variable("Walk", 0.0)
             self.character_graph.set_variable("Action", "Idle")
+            commanded_speed = 0.0
+
+        # Advance the animation by the physics dt that just elapsed.  Without this the graph is only
+        # evaluated on Kit application updates, i.e. once per ARENA_ISAAC_RENDER_EVERY_N_STEPS
+        # physics steps, and the rendered character receives a fraction of the locomotion time it
+        # needs.  This does not change the render cadence in any way.
+        self._tick_character_animation(dt, commanded_speed)
 
         # If we have a backend, update the state of the person
         if self._backend:
@@ -210,6 +262,57 @@ class Person:
 
         # if self.character_skel_root_stage_path is not None:
         #     PeopleManager.get_people_manager().add_person(self.character_skel_root_stage_path, self)
+
+    def _tick_character_animation(self, dt: float, commanded_speed: float):
+        """Advance this character's animation graph by the elapsed physics ``dt``.
+
+        ``omni.anim.graph.core`` normally evaluates the graph from Kit's application update, which
+        the eval loop performs only on rendered steps, so the animation was starved of time.
+        ``Character.update(dt)`` supplies the time explicitly and needs no application update.
+
+        The full ``dt`` is supplied on every step, rendered ones included: once a character has been
+        ticked manually its automatic evaluation stops, so skipping the rendered step would lose that
+        step's time rather than avoid double counting.  See ``animation_clock.animation_tick_dt``.
+
+        Failure is never silent.  ``Character.update()`` returns ``None`` and does not raise when the
+        timeline is not playing, so the return value cannot be trusted; progress is measured instead.
+        """
+        graph = self._character_graph
+        if graph is None or not self._anim_tick_enabled:
+            return
+
+        tick = getattr(graph, "update", None)
+        if not callable(tick):
+            if not self._anim_tick_broken_reported:
+                self._anim_tick_broken_reported = True
+                carb.log_error(
+                    "[PedestrianAnimation] omni.anim.graph.core Character has no update(dt): "
+                    "cannot drive the animation from the physics step, so rendered pedestrians will "
+                    f"lag the logical positions the evaluation grades against. Character type is "
+                    f"{type(graph).__name__}. Set {MANUAL_TICK_ENV_VAR}=0 to accept that "
+                    "deliberately."
+                )
+            return
+
+        try:
+            tick(animation_tick_dt(dt))
+        except Exception as exc:
+            if not self._anim_tick_broken_reported:
+                self._anim_tick_broken_reported = True
+                carb.log_error(
+                    f"[PedestrianAnimation] Character.update(dt) raised {exc!r} for "
+                    f"{self.character_skel_root_stage_path}; rendered pedestrians will lag the "
+                    "logical positions the evaluation grades against"
+                )
+            return
+
+        report = self._anim_tick_health.record(dt, commanded_speed, self._state.position)
+        if report is not None:
+            severity, message = report
+            if severity == "error":
+                carb.log_error(message)
+            else:
+                carb.log_warn(message)
 
     def update_target_positions(self, positions, walk_speed=1.0):
         """
@@ -280,6 +383,19 @@ class Person:
         PeopleManager.get_people_manager().add_person(self._stage_prefix, self)
 
     def add_animation_graph_to_agent(self):
+        """Author the AnimationGraphAPI onto this character's SkelRoot.
+
+        Note on ``RemoveAnimationGraphAPICommand``.  ``docs/benchmark/troubleshooting.md:238`` tells
+        reviewers to reject patches that call it *from the HuNav replay path*, because a direct-pose
+        workaround used it to detach the graph and slide the prim by hand.  The call below is the
+        opposite: it is a setup-time remove-then-reapply so ``ApplyAnimationGraphAPICommand`` cannot
+        collide with an API already present (e.g. from the character asset, or from a previous spawn
+        at the same stage path), and the graph is left *enabled* two lines later.  It never writes a
+        transform.  It is only reached while ``character_graph`` is unresolved, and
+        ``_acquire_character_graph`` throttles how often that happens -- an unthrottled
+        remove-then-reapply on every physics step could tear down an API that was in the middle of
+        becoming visible through Fabric.
+        """
 
         # Get the animation graph that we are going to add to the person
         animation_graph = self._current_stage.GetPrimAtPath(Person.character_root_prim_path + "/Biped_Setup/CharacterAnimation/AnimationGraph")
