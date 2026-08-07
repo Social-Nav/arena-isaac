@@ -684,12 +684,13 @@ class ManualReplicatorCameraPublisher:
                 depth_annot = rep.AnnotatorRegistry.get_annotator('distance_to_camera')
                 depth_annot.attach(render_product)
                 depth_pub = self._node.create_publisher(sensor_msgs.msg.Image, f'{topic_base}/depth', 10)
+            rgb_topic_name = str(spec.get('rgb_topic_name') or 'image').strip('/') or 'image'
             state = {
                 'render_product': render_product,
                 'rgb_annot': rgb_annot,
                 'depth_annot': depth_annot,
                 'params_annot': params_annot,
-                'rgb_pub': self._node.create_publisher(sensor_msgs.msg.Image, f'{topic_base}/image', 10),
+                'rgb_pub': self._node.create_publisher(sensor_msgs.msg.Image, f'{topic_base}/{rgb_topic_name}', 10),
                 'depth_pub': depth_pub,
                 'info_pub': self._node.create_publisher(sensor_msgs.msg.CameraInfo, f'{topic_base}/camera_info', 10),
                 'frame': str(spec['frame']),
