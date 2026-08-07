@@ -62,6 +62,7 @@ def _register_vln_camera_publish_spec(
     camera_prim_path: str,
     namespace: str,
     camera_topic: str,
+    rgb_topic_name: str = 'image',
     frame: str,
     resolution: tuple[int, int],
     publish_depth: bool,
@@ -73,6 +74,7 @@ def _register_vln_camera_publish_spec(
         'namespace': str(namespace or ''),
         'camera_topic': str(camera_topic),
         'topic_base': topic_base,
+        'rgb_topic_name': str(rgb_topic_name or 'image').strip('/'),
         'frame': str(frame),
         'resolution': [int(resolution[0]), int(resolution[1])],
         'publish_depth': bool(publish_depth),
@@ -664,7 +666,14 @@ def _publish_camera_info(render_product: str, frame: str, namespace: str, camera
     return writer
 
 
-def _publish_rgb(render_product: str, frame: str, namespace: str, camera_topic: str, step_size: int):
+def _publish_rgb(
+    render_product: str,
+    frame: str,
+    namespace: str,
+    camera_topic: str,
+    step_size: int,
+    rgb_topic_name: str = 'image',
+):
     render_product_path = _render_product_path(render_product)
     rv = omni.syntheticdata.SyntheticData.convert_sensor_type_to_rendervar(sd.SensorType.Rgb.name)
     writer = rep.writers.get(rv + 'ROS2PublishImage')
@@ -672,7 +681,7 @@ def _publish_rgb(render_product: str, frame: str, namespace: str, camera_topic: 
         frameId=frame,
         nodeNamespace=namespace,
         queueSize=1,
-        topicName=os.path.join(camera_topic, 'image'),
+        topicName=os.path.join(camera_topic, str(rgb_topic_name or 'image').strip('/')),
     )
     writer.attach([render_product])
     gate_path = omni.syntheticdata.SyntheticData._get_node_path(rv + 'IsaacSimulationGate', render_product_path)
@@ -769,6 +778,7 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
     frame_namespace = namespace.split('/')[-1] if namespace else ''
     base_frame_id = base_frame or BASE_FRAME_DEFAULT
     head_frame = os.path.join(frame_namespace, base_frame_id, 'head_camera') if frame_namespace else os.path.join(base_frame_id, 'head_camera')
+    chassis_frame = os.path.join(frame_namespace, 'chassis_camera') if frame_namespace else 'chassis_camera'
     top_down_frame = os.path.join(frame_namespace, 'top_down_camera') if frame_namespace else 'top_down_camera'
     step_size = 6  # Isaac default 60 Hz -> 10 Hz image streams.
 
@@ -799,6 +809,35 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
             carb.log_warn(f'[SpawnUsdRobot] Publishing head camera {head_camera_path} on /{namespace}/head_camera/*')
         except Exception as e:
             carb.log_error(f'[SpawnUsdRobot] Failed to create head_camera ROS publishers: {e}\n{traceback.format_exc()}')
+            return False
+
+    chassis_camera_path = _find_named_camera_prim(prim_path, 'chassis_camera')
+    if chassis_camera_path is None:
+        carb.log_warn(f'[SpawnUsdRobot] No chassis_camera Camera prim found under {prim_path}; chassis camera ROS publishers not created')
+    else:
+        try:
+            chassis_resolution = (640, 480)
+            chassis_rp = rep.create.render_product(chassis_camera_path, chassis_resolution)
+            chassis_handles = [
+                chassis_rp,
+                _publish_camera_info(chassis_rp, chassis_frame, namespace, 'chassis_camera', step_size),
+                _publish_rgb(chassis_rp, chassis_frame, namespace, 'chassis_camera', step_size, 'rgb'),
+                *_publish_depth(chassis_rp, chassis_frame, namespace, 'chassis_camera', step_size),
+            ]
+            _VLN_CAMERA_REPLICATOR_HANDLES.extend(chassis_handles)
+            _register_vln_camera_publish_spec(
+                key=f'{namespace}:chassis_camera',
+                camera_prim_path=chassis_camera_path,
+                namespace=namespace,
+                camera_topic='chassis_camera',
+                rgb_topic_name='rgb',
+                frame=chassis_frame,
+                resolution=chassis_resolution,
+                publish_depth=True,
+            )
+            carb.log_warn(f'[SpawnUsdRobot] Publishing chassis camera {chassis_camera_path} on /{namespace}/chassis_camera/*')
+        except Exception as e:
+            carb.log_error(f'[SpawnUsdRobot] Failed to create chassis_camera ROS publishers: {e}\n{traceback.format_exc()}')
             return False
 
     try:
