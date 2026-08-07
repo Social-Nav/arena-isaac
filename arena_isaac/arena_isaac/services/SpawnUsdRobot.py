@@ -24,6 +24,9 @@ geom = _safe_import("isaac_utils.utils", "geom")
 world_path = _safe_import("isaac_utils.utils.path", "world_path")
 create_prim_safe = _safe_import("isaac_utils.utils.prim", "create_prim_safe")
 ensure_path = _safe_import("isaac_utils.utils.prim", "ensure_path")
+enforce_exclusive_articulation_writer = _safe_import(
+    "isaac_utils.utils.articulation_writers", "enforce_exclusive_articulation_writer"
+)
 
 from isaacsim_msgs.srv import SpawnUsdRobot as SpawnUsdRobot_srv
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
@@ -387,7 +390,6 @@ def _disable_embedded_twist_subscribers(prim_path: str) -> int:
         return 0
 
     disabled = 0
-    twist_graph_paths: set[str] = set()
     for prim in Usd.PrimRange(root_prim):
         if 'OmniGraph' not in prim.GetTypeName():
             continue
@@ -398,8 +400,6 @@ def _disable_embedded_twist_subscribers(prim_path: str) -> int:
         node_type = str(node_type_attr.Get() or '')
         if node_type not in TWIST_SUBSCRIBER_TYPES:
             continue
-
-        twist_graph_paths.add(str(prim.GetParent().GetPath()))
 
         topic_attr = prim.GetAttribute('inputs:topicName')
         try:
@@ -419,39 +419,23 @@ def _disable_embedded_twist_subscribers(prim_path: str) -> int:
             )
 
     # USD-authored IsaacArticulationController nodes in the same graph as the
-    # embedded ROS2SubscribeTwist can keep executing with stale/zero commands and
-    # overwrite Arena's explicit controller every tick.  Do not blanket-disable
-    # unrelated controllers: Ai2_Bot2 also has a ROS_JointStates graph whose
-    # controller targets base_link and is not part of cmd_vel handling.
-    for prim in Usd.PrimRange(root_prim):
-        if 'OmniGraph' not in prim.GetTypeName():
-            continue
-        parent_graph_path = str(prim.GetParent().GetPath())
-        if parent_graph_path not in twist_graph_paths:
-            continue
-        node_type_attr = prim.GetAttribute('node:type')
-        if not node_type_attr or not node_type_attr.IsValid():
-            continue
-        node_type = str(node_type_attr.Get() or '')
-        if node_type != 'isaacsim.core.nodes.IsaacArticulationController':
-            continue
-        target_rel = prim.GetRelationship('inputs:targetPrim')
-        if not target_rel or not target_rel.IsValid():
-            continue
-        try:
-            old_targets = [str(t) for t in target_rel.GetForwardedTargets()]
-            target_rel.ClearTargets(removeSpec=False)
-            carb.log_warn(
-                f"[SpawnUsdRobot] Disabled embedded ArticulationController "
-                f"targets {old_targets} on {prim.GetPath()}"
-            )
-            disabled += 1
-        except Exception as e:
-            carb.log_warn(
-                f"[SpawnUsdRobot] Failed to disable embedded ArticulationController "
-                f"on {prim.GetPath()}: {e}"
-            )
-
+    # embedded ROS2SubscribeTwist keep executing with stale/zero commands and
+    # overwrite Arena's explicit controller every tick.
+    #
+    # This used to be handled here with `targetPrim.ClearTargets(removeSpec=False)`, which is
+    # INERT: measured on the live composed stage, the chassis controller's composed target list is
+    # ['/World/Robots/Ai2_Bot2'] both before and after that call, because ClearTargets only drops
+    # opinions in the current edit target while the referenced robot layer keeps its own.  The
+    # `len(targetPrim) == 0` fail-closed branch in OgnIsaacArticulationController.compute was
+    # therefore never reached, and this function logged "Disabled embedded ArticulationController
+    # targets [...]" on every run without having disabled anything -- for the whole life of the
+    # benchmark.  Cost: the drive target survived on 37.8 % of graph ticks and the robot achieved
+    # 0.291 of its commanded speed instead of 0.876.
+    #
+    # It is now done by `enforce_exclusive_articulation_writer`, called from
+    # `_setup_ai2_bot2_control_graph` AFTER Arena's own controller exists, so that the invariant
+    # ("exactly one live writer of these joints") can be both applied and VERIFIED against the
+    # composed stage.  Do not re-add a disable step here that reports success without checking.
     return disabled
 
 
@@ -466,13 +450,14 @@ def _setup_ai2_bot2_control_graph(prim_path: str, articulation_prim_path: str, n
 
     cmd_vel_topic = f"/{namespace.lstrip('/')}/cmd_vel"
     graph_path = os.path.join(prim_path, 'arena_ai2_bot2_diff_drive_controller')
+    joint_names = ['driving_left_joint', 'driving_right_joint']
     _disable_embedded_twist_subscribers(prim_path)
 
     ok = diff_drive_graph(
         graph_path=graph_path,
         prim_path=articulation_prim_path,
         cmd_vel_topic=cmd_vel_topic,
-        joint_names=['driving_left_joint', 'driving_right_joint'],
+        joint_names=joint_names,
         wheel_distance=0.416,
         wheel_radius=0.085,
         max_linear_speed=0.65,
@@ -480,14 +465,41 @@ def _setup_ai2_bot2_control_graph(prim_path: str, articulation_prim_path: str, n
         max_angular_speed=1.5,
         min_angular_speed=-1.5,
     )
-    if ok:
-        carb.log_warn(
-            f"[SpawnUsdRobot] Created Ai2_Bot2 Arena diff-drive graph at {graph_path} "
-            f"subscribing to {cmd_vel_topic} and targeting {articulation_prim_path}"
-        )
-    else:
+    if not ok:
         carb.log_error(f"[SpawnUsdRobot] Failed to create Ai2_Bot2 Arena diff-drive graph at {graph_path}")
-    return bool(ok)
+        return False
+
+    # Ai2_Bot2's own USD ships a second IsaacArticulationController wired straight to
+    # OnPlaybackTick, writing a velocity target of 0.0 to these same two joints on EVERY graph
+    # tick, so it races the controller created just above.  Neutralise it and VERIFY on the
+    # composed stage; this returns False rather than logging a success it has not earned.
+    if enforce_exclusive_articulation_writer is None:
+        carb.log_error(
+            '[SpawnUsdRobot] Cannot verify exclusive articulation control: '
+            'isaac_utils.utils.articulation_writers unavailable. Refusing to report a working '
+            'Ai2_Bot2 control graph, because a duplicate writer would silently halve its speed.'
+        )
+        return False
+    if not enforce_exclusive_articulation_writer(
+        stage=omni.usd.get_context().get_stage(),
+        root_path=prim_path,
+        own_node_path=os.path.join(graph_path, 'articulation_controller'),
+        joint_names=joint_names,
+        log_warn=carb.log_warn,
+        log_error=carb.log_error,
+    ):
+        carb.log_error(
+            f"[SpawnUsdRobot] Ai2_Bot2 diff-drive graph at {graph_path} was created but exclusive "
+            'articulation control could NOT be verified; the robot would execute a fraction of its '
+            'commanded velocity. Spawn treated as failed.'
+        )
+        return False
+
+    carb.log_warn(
+        f"[SpawnUsdRobot] Created Ai2_Bot2 Arena diff-drive graph at {graph_path} "
+        f"subscribing to {cmd_vel_topic} and targeting {articulation_prim_path}"
+    )
+    return True
 
 
 def _remap_articulation_target(prim_path: str, articulation_prim_path: str):
