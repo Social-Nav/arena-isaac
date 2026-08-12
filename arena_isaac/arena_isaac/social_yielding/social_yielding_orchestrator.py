@@ -18,18 +18,25 @@ containers). Reprojection (pixel_to_map) is pure numpy; the selector is HTTP.
 """
 
 import math
+import os
 import time
 from pathlib import Path
+
+import yaml
 
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.action import ActionClient
 
-from std_msgs.msg import String, Bool
-from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Odometry, Path as NavPath
+import tf2_ros
+from tf2_ros import TransformException
+
+from std_msgs.msg import String, Bool, Int16
+from geometry_msgs.msg import PoseStamped
 from nav2_msgs.msg import Costmap, BehaviorTreeLog
+from nav2_msgs.action import ComputePathToPose
 from std_srvs.srv import Trigger
 
 # Reprojection lives next to this file (same social_yielding subpackage).
@@ -37,16 +44,29 @@ from arena_isaac.social_yielding.pixel_to_map import pixel_to_map
 from arena_isaac.social_yielding.social_yielding_selector import select_yielding_goal
 
 
-ROBOT = "Ai2_Bot2"
+# From the `robot` launch arg via ARENA_ROBOT; must match the trigger's value.
+ROBOT = os.environ.get("ARENA_ROBOT", "").strip() or "Ai2_Bot2"
 NS = f"/task_generator_node/{ROBOT}"
 GOAL_TOPIC = f"{NS}/goal_pose"
 COSTMAP_TOPIC = f"{NS}/global_costmap/costmap_raw"   # nav2_msgs/Costmap, raw 0-255
+COMPUTE_PATH_ACTION = f"{NS}/compute_path_to_pose"
 SNAPSHOT_READY_TOPIC = "isaac/snapshot_ready"
 UNPAUSE_SRV = "isaac/UnpauseSimulation"
+PAUSE_SRV = "isaac/PauseSimulation"
+CAPTURE_SRV = "isaac/CaptureSnapshot"
+BASE_FRAME = f"{ROBOT}/base_link"
 
-# Post-unpause motion probe cadence (seconds between printed lines). Kept coarse so the
-# continuous stream doesn't flood the console.
-PROBE_PERIOD = 2.0
+
+# --- Yield-recovery loop (drive to yield goal Y -> can we get back to the pre-yield spot A?
+#     yes:行人让开了, resume original goal G. no: re-yield from here.) ---
+ARRIVE_TOL = 0.5           # m — robot within this of yield goal Y counts as "arrived" (TF map dist)
+ARRIVE_TIMEOUT = 90.0      # s — give up waiting to reach Y (wall clock; probe already bails on pause).
+                           # 40->90: robot was moving toward Y (dist shrinking) but slowly, so give
+                           # it more time to actually arrive before declaring failure.
+MAX_YIELD_ROUNDS = 5       # safety valve: after this many consecutive yields, force-resume G and stop
+# Topic (latched) telling the proactive trigger a yield episode is in progress, so it does NOT
+# fire another yield mid-episode (incl. while re-yielding). Published by orchestrator.
+YIELD_ACTIVE_TOPIC = "social_yielding/active"
 
 # Goal validation: reject a candidate goal whose global-costmap cell cost is >= this.
 # nav2 raw costs: 254=LETHAL, 253=INSCRIBED (inside robot radius of an obstacle),
@@ -67,15 +87,11 @@ class SocialReplanOrchestrator(Node):
         self._goal_pub = self.create_publisher(PoseStamped, GOAL_TOPIC, 10)
         self._unpause = self.create_client(Trigger, UNPAUSE_SRV)
 
-        # --- post-unpause motion probe caches (diagnose "robot only spins, ignores new goal") ---
-        self._cmd_nav = None   # controller_server output (cmd_vel_nav): the DECISION
-        self._cmd_out = None   # final cmd_vel (after smoother/collision): what the base gets
-        self._odom = None      # measured body twist
-        self._plan = None      # received_global_plan (does it point at the new goal?)
-        self.create_subscription(Twist, f"{NS}/cmd_vel_nav", lambda m: setattr(self, "_cmd_nav", m), 10)
-        self.create_subscription(Twist, f"{NS}/cmd_vel", lambda m: setattr(self, "_cmd_out", m), 10)
-        self.create_subscription(Odometry, f"{NS}/odom", lambda m: setattr(self, "_odom", m), 10)
-        self.create_subscription(NavPath, f"{NS}/received_global_plan", lambda m: setattr(self, "_plan", m), 10)
+        # NOTE: the cmd_vel_nav / cmd_vel / odom / received_global_plan taps that used to live
+        # here were removed. They only ever fed per-sample log lines, and that job now belongs
+        # to the controller's [CMD-CHAIN] + [MOTION-DIAG] lines, which see the whole command
+        # chain (solved -> cmd_vel_nav -> smoothed -> cmd_vel -> odom) from inside the process
+        # that actually solves it. Duplicating it here produced two streams of the same story.
         # global costmap (raw 0-255) to validate a candidate goal isn't on an obstacle/wall
         self._costmap = None
         self.create_subscription(Costmap, COSTMAP_TOPIC, lambda m: setattr(self, "_costmap", m), 10)
@@ -95,12 +111,78 @@ class SocialReplanOrchestrator(Node):
         self.create_subscription(
             Bool, "isaac/sim_running", lambda m: setattr(self, "_sim_running", bool(m.data)), _state_qos)
 
+        # --- yield-recovery state machine ---
+        # A = robot map pose captured at the START of a yield episode (the spot where it got
+        #     blocked). Fixed for the whole episode (NOT updated on re-yields). Recovery test
+        #     is "can we plan from here back to A?" -> if yes, pedestrians cleared -> resume G.
+        self._pos_A = None            # (x, y) in map frame, or None
+        self._orig_goal_G = None      # PoseStamped, the scenario's final goal
+        self._yield_active = False    # True between first yield and resume/giveup
+        self._yield_round = 0         # consecutive yields this episode (safety valve)
+        self._pending_reyield = False # set when A still blocked -> capture again after _busy clears
+
+        # TF for robot map pose + resume-path check
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        # re-yield needs to pause + capture a fresh snapshot ourselves
+        self._pause = self.create_client(Trigger, PAUSE_SRV)
+        self._capture = self.create_client(Trigger, CAPTURE_SRV)
+        # global planner query: "can I reach A from here?"
+        self._compute_path_cli = ActionClient(self, ComputePathToPose, COMPUTE_PATH_ACTION)
+        # latched "yield episode in progress" flag -> proactive trigger suppresses new yields
+        _latch_qos = QoSProfile(depth=1)
+        _latch_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self._active_pub = self.create_publisher(Bool, YIELD_ACTIVE_TOPIC, _latch_qos)
+        self._publish_active(False)
+
+        # Scenario-level enable (latched, from task_generator). The trigger already stops firing
+        # when disabled, so normally no snapshot arrives; this is a defensive gate so a stray
+        # snapshot_ready (e.g. a manual Isaac capture) can't start an LLM yield episode when off.
+        self._enabled = False
+        self.create_subscription(
+            Bool, "/social_yielding/enabled",
+            lambda m: setattr(self, "_enabled", bool(m.data)), _state_qos)
+
+        # A task_reset ABANDONS whatever episode we were driving: the robot is teleported
+        # back to start and a fresh goal G is published, so spot A, the yield goal Y and the
+        # in-flight arrival wait all describe a world that no longer exists. Without this the
+        # episode state leaks across resets -- _yield_active stays True, which keeps
+        # social_yielding/active latched True, which makes the proactive trigger skip every
+        # future episode ("orchestrator owns control") and the pipeline never fires again.
+        self.create_subscription(
+            Int16, "/task_generator_node/task_reset", self._cb_task_reset, 10)
+
         self.get_logger().info(
-            f"SocialReplanOrchestrator ready | listening {SNAPSHOT_READY_TOPIC} "
+            f"SocialReplanOrchestrator ready | robot={ROBOT} | listening {SNAPSHOT_READY_TOPIC} "
             f"| goal -> {GOAL_TOPIC}")
+
+    def _cb_task_reset(self, msg: Int16):
+        """Abandon the current yield episode; the new task owns the robot now."""
+        was_active = self._yield_active or self._busy
+        # Supersede any running probe / arrival wait so _drive_and_wait_arrival returns
+        # False promptly instead of chasing the previous episode's Y.
+        self._probe_epoch += 1
+        self._yield_active = False
+        self._busy = False
+        self._pos_A = None
+        self._orig_goal_G = None
+        self._yield_round = 0
+        self._pending_reyield = False
+        self._publish_active(False)   # re-arm the proactive trigger for the new episode
+        if was_active:
+            self.get_logger().warn(
+                f"[Reset] task_reset #{msg.data} arrived mid-yield -> episode ABANDONED, "
+                f"state cleared, trigger re-armed")
+        else:
+            self.get_logger().debug(f"[Reset] task_reset #{msg.data} -> state cleared")
 
     def _cb_snapshot_ready(self, msg: String):
         snapshot_dir = msg.data.strip()
+        if not self._enabled:
+            self.get_logger().info(
+                f"[Replan] social_yielding disabled; ignoring snapshot: {snapshot_dir}",
+                throttle_duration_sec=5.0)
+            return
         if self._busy:
             self.get_logger().warn(f"[Replan] busy, ignoring: {snapshot_dir}")
             return
@@ -153,6 +235,144 @@ class SocialReplanOrchestrator(Node):
             return None  # outside costmap bounds
         return int(cm.data[row * sx + col])
 
+    # ── yield-recovery helpers ─────────────────────────────────────────────────
+
+    def _robot_map_pose(self):
+        """Robot (x, y) in the map frame via TF, or None. Used for arrival + A capture."""
+        try:
+            t = self._tf_buffer.lookup_transform("map", BASE_FRAME, rclpy.time.Time())
+            return (t.transform.translation.x, t.transform.translation.y)
+        except TransformException:
+            return None
+
+    def _load_original_goal_G(self) -> PoseStamped | None:
+        """Load the ACTIVE task's final goal G from its scenario.yaml.
+
+        Resolves the scenario the current task is using via live ROS params
+        (world + task.scenario.file), then reads the goal. Supports both schemas:
+          - robot:  {waypoints: [[x,y,yaw], ...]}  -> G = last waypoint  (current format)
+          - robots: [{goal: [x,y,yaw]}]            -> G = robots[0].goal (legacy)
+        """
+        def _param(node, name):
+            import subprocess
+            env = os.environ.copy()
+            env.setdefault('ROS_DOMAIN_ID', '1')
+            try:
+                r = subprocess.run(['ros2', 'param', 'get', node, name],
+                                   capture_output=True, text=True, timeout=5, env=env)
+            except Exception:
+                return None
+            for line in r.stdout.splitlines():
+                if 'value is:' in line.lower() or 'string value' in line.lower():
+                    return line.split(':')[-1].strip().strip("'\"")
+            return None
+
+        world = _param('/task_generator_node', 'world')
+        scenario = _param('/task_generator_node', 'task.scenario.file')
+        if not world:
+            self.get_logger().warn("[Resume] cannot read 'world' param; no G")
+            return None
+        try:
+            import ament_index_python.packages as ament_index
+            ass = Path(ament_index.get_package_share_path('arena_simulation_setup'))
+        except Exception:
+            ass = Path(os.environ.get('ASS_DIR', 'arena_simulation_setup'))
+
+        if not scenario:
+            sdir = ass / 'worlds' / world / 'scenarios'
+            cands = sorted(e.name for e in sdir.iterdir() if e.is_dir()) if sdir.is_dir() else []
+            scenario = cands[0] if cands else None
+            if not scenario:
+                return None
+        path = ass / 'worlds' / world / 'scenarios' / scenario / 'scenario.yaml'
+        if not path.exists():
+            self.get_logger().warn(f"[Resume] scenario not found: {path}")
+            return None
+        try:
+            data = yaml.safe_load(open(path))
+        except Exception as e:
+            self.get_logger().warn(f"[Resume] scenario parse failed: {e}")
+            return None
+
+        gxyz = None
+        # current schema: robot.waypoints (goal = last waypoint)
+        rob = data.get('robot')
+        if isinstance(rob, dict):
+            wps = rob.get('waypoints') or []
+            if wps:
+                gxyz = wps[-1]
+        # legacy schema: robots[0].goal
+        if gxyz is None:
+            robs = data.get('robots') or []
+            if robs and isinstance(robs[0], dict) and robs[0].get('goal'):
+                gxyz = robs[0]['goal']
+        if not gxyz or len(gxyz) < 2:
+            self.get_logger().warn(f"[Resume] no goal in {path}")
+            return None
+
+        gx, gy = float(gxyz[0]), float(gxyz[1])
+        gyaw = math.radians(float(gxyz[2])) if len(gxyz) > 2 else 0.0
+        g = PoseStamped()
+        g.header.frame_id = 'map'
+        g.pose.position.x = gx
+        g.pose.position.y = gy
+        g.pose.orientation.z = math.sin(gyaw / 2.0)
+        g.pose.orientation.w = math.cos(gyaw / 2.0)
+        self.get_logger().info(f"[Resume] original goal G = ({gx:.2f}, {gy:.2f}) from {scenario}")
+        return g
+
+    def _can_plan_to(self, x: float, y: float, timeout: float = 5.0) -> bool:
+        """Ask the global planner if a path from the robot's current pose to (x,y) exists.
+        Used to test whether pedestrians have cleared enough to get back to spot A."""
+        if not self._compute_path_cli.wait_for_server(timeout_sec=2.0):
+            self.get_logger().warn("[Resume] ComputePathToPose server unavailable; assume blocked")
+            return False
+        goal = ComputePathToPose.Goal()
+        goal.goal.header.frame_id = "map"
+        goal.goal.header.stamp = self.get_clock().now().to_msg()
+        goal.goal.pose.position.x = float(x)
+        goal.goal.pose.position.y = float(y)
+        goal.goal.pose.orientation.w = 1.0
+        goal.planner_id = ""
+        fut = self._compute_path_cli.send_goal_async(goal)
+        deadline = time.monotonic() + timeout
+        while not fut.done():
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.05)
+        gh = fut.result()
+        if gh is None or not gh.accepted:
+            return False
+        rfut = gh.get_result_async()
+        while not rfut.done():
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.05)
+        res = rfut.result()
+        return res is not None and res.status == 4 and len(res.result.path.poses) > 0  # SUCCEEDED
+
+    def _request_pause_and_capture(self) -> bool:
+        """Re-trigger a yield: pause the sim, then request a fresh snapshot. Isaac will
+        publish snapshot_ready, which re-enters _cb_snapshot_ready for the next round."""
+        if not self._call_trigger(self._pause, "pause", 2.0):
+            self.get_logger().error("[Re-yield] pause failed; cannot capture")
+            return False
+        return self._call_trigger(self._capture, "capture", 2.0)
+
+    def _call_trigger(self, client, name: str, timeout: float) -> bool:
+        if not client.service_is_ready() and not client.wait_for_service(timeout_sec=timeout):
+            self.get_logger().warn(f"[Re-yield] {name} service unavailable")
+            return False
+        fut = client.call_async(Trigger.Request())
+        deadline = time.monotonic() + timeout
+        while not fut.done():
+            if time.monotonic() > deadline:
+                self.get_logger().warn(f"[Re-yield] {name} timed out")
+                return False
+            time.sleep(0.02)
+        r = fut.result()
+        return bool(r is not None and r.success)
+
     def _run_replan(self, snapshot_dir: str):
         try:
             self.get_logger().info(f"[Replan] step 1/4: snapshot={snapshot_dir}")
@@ -160,6 +380,23 @@ class SocialReplanOrchestrator(Node):
             if not d.is_dir():
                 self.get_logger().error(f"[Replan] snapshot dir not found: {d}")
                 return
+
+            # Episode bookkeeping: on the FIRST yield of an episode, capture spot A
+            # (where we're blocked now) and the original goal G. A is fixed for the
+            # whole episode; re-yields do NOT update it.
+            if not self._yield_active:
+                a = self._robot_map_pose()
+                if a is not None:
+                    self._pos_A = a
+                self._orig_goal_G = self._load_original_goal_G()
+                self._yield_active = True
+                self._yield_round = 0
+                self._publish_active(True)   # suppress the proactive trigger for the whole episode
+                self.get_logger().warn(
+                    f"[Yield] episode START | A={('(%.2f,%.2f)' % self._pos_A) if self._pos_A else 'TF-FAIL'} "
+                    f"| G={'ok' if self._orig_goal_G else 'MISSING'}")
+            self._yield_round += 1
+            self.get_logger().info(f"[Yield] round {self._yield_round}/{MAX_YIELD_ROUNDS}")
 
             # 1-2. selector -> pixel -> map, with retry: regenerate the goal if it
             #      reprojects onto an obstacle/wall (high global-costmap cost).
@@ -248,80 +485,139 @@ class SocialReplanOrchestrator(Node):
             self.get_logger().warn(
                 "[Replan] step 4/4: UNPAUSED + yielding goal published immediately (preempts old goal)")
 
-            # 5. probe the control chain so we can see WHETHER it enters FollowPath.
-            self._probe_motion(goal)
+            # 5. drive to Y and wait for arrival (TF map distance). No en-route checking.
+            if not self._drive_and_wait_arrival(goal):
+                # STATE LEAK if we just return here: _yield_active stays True, so
+                # social_yielding/active remains latched True and the proactive trigger
+                # skips EVERY later episode ("orchestrator owns control"). The robot also
+                # keeps Y as its goal and never gets G back, so it parks at the yield spot
+                # for the rest of the run. Ending the episode is the honest recovery: give
+                # the robot its real goal back and re-arm the trigger.
+                #
+                # A pause (superseded) is different from a timeout: on pause another yield
+                # cycle is already starting and it owns the flow, so leave state alone.
+                if not self._sim_running:
+                    self.get_logger().warn(
+                        "[Yield] arrival wait superseded (sim paused); leaving episode state "
+                        "to the cycle that paused us")
+                    return
+                self.get_logger().error(
+                    f"[Yield] did not reach Y within {ARRIVE_TIMEOUT}s -> ENDING the yield "
+                    f"episode and resuming the original goal G, so the trigger is re-armed "
+                    f"instead of being latched off for the rest of the run")
+                self._resume_original_goal()
+                return
+
+            # 6. RECOVERY DECISION: at Y, can we now plan back to spot A? Yes -> pedestrians
+            #    cleared -> resume G. No -> re-yield (unless we've hit the safety cap).
+            self._decide_resume_or_reyield()
         except Exception as e:  # noqa: BLE001
             self.get_logger().error(f"[Replan] crashed: {e}")
             import traceback
             traceback.print_exc()
         finally:
             self._busy = False
+            # If A was still blocked, trigger the next yield now that _busy is clear
+            # (pause+capture -> Isaac publishes snapshot_ready -> _cb_snapshot_ready re-enters).
+            if self._pending_reyield:
+                self._pending_reyield = False
+                self._request_pause_and_capture()
 
-    def _probe_motion(self, goal: PoseStamped):
-        """After unpause, stream the control chain for a few seconds so it's obvious
-        WHO is driving the robot (path-follower vs a BT recovery) and why.
-
-        Read the lines like this:
-          CONTROL = which BT node is RUNNING (from behavior_tree_log):
-            "FollowPath"        -> normal path-following (controller_server drives).
-            "RECOVERY:BackUp/Spin/Wait/..." -> a recovery is driving; the robot is NOT
-              following the path (this is why cmd_nav is empty and you see slow backup).
-          cmd_nav = controller_server output (the DECISION).
-            wz!=0, vx~0 (sustained)  -> controller is commanding IN-PLACE ROTATION
-              (RotationShim aligning to a goal that's behind the robot). If wz keeps
-              flipping sign -> dithering (never converges) = the spin you see.
-            vx>0                     -> controller IS driving forward; problem is downstream.
-            0,0                      -> controller produced nothing (MPC opt fail / stale TF).
-          cmd_out = final cmd_vel. If cmd_nav has vx>0 but cmd_out is 0 -> smoother/
-            collision_monitor is zeroing it.
-          odom    = what actually executed.
-          goalΔ   = heading error (deg) from robot to the new goal; |Δ|>90 explains an
-            initial in-place rotate. dist = range to goal.
-          plan→goal = does the global plan's endpoint match the new goal? (yes = nav
-            accepted it; you said you can see the new path, so expect ~0).
-        """
+    def _drive_and_wait_arrival(self, goal: PoseStamped) -> bool:
+        """Drive to yield goal Y and wait for arrival, streaming the control chain meanwhile.
+        Returns True once within ARRIVE_TOL of Y (TF map distance), False on timeout or if the
+        sim pauses (superseded). The path-back-to-A test happens ONLY after arrival
+        (in _decide_resume_or_reyield), not en route."""
         gx, gy = goal.pose.position.x, goal.pose.position.y
         self.get_logger().warn(
-            f"[Probe] streaming control chain CONTINUOUSLY "
-            f"(new goal=({gx:+.2f},{gy:+.2f})) — until next replan. Ctrl-C to stop.")
-        # Continuous stream: run until (a) the sim pauses/freezes again (next yield cycle
-        # begins), or (b) a new snapshot/replan supersedes this probe. Stopping on pause is
-        # essential: otherwise this wall-clock loop keeps printing stale cached values while
-        # the sim is frozen, AND it blocks _run_replan from returning (so _busy never clears
-        # and the next replan is dropped -> infinite stale print).
+            f"[Yield] driving to Y=({gx:+.2f},{gy:+.2f}); waiting for arrival (tol={ARRIVE_TOL}m)")
         self._probe_epoch += 1
         my_epoch = self._probe_epoch
+        start = time.monotonic()
+        # Silent while healthy: motion detail is the controller's job now ([MOTION-DIAG] /
+        # [CMD-CHAIN]). We still sample at 0.5s because ARRIVAL DETECTION needs it -- we just
+        # do not print each sample. Distance is reported on the outcome lines instead.
+        ARRIVE_SAMPLE = 0.5
+        dist = float('nan')
+        start_dist = None
+        tf_failures = 0
         while my_epoch == self._probe_epoch and self._sim_running:
-            time.sleep(PROBE_PERIOD)
+            time.sleep(ARRIVE_SAMPLE)
+            if time.monotonic() - start > ARRIVE_TIMEOUT:
+                # Timeout is the decisive moment, so make this line carry everything: how far
+                # we still are, how much ground we actually covered, and WHO was driving
+                # (FollowPath vs a BT recovery) -- none of which [MOTION-DIAG] can tell us.
+                closed = (start_dist - dist) if (start_dist is not None and dist == dist) else float('nan')
+                self.get_logger().warn(
+                    f"[Yield] arrival timeout ({ARRIVE_TIMEOUT}s): dist={dist:.2f}m, "
+                    f"closed only {closed:.2f}m since start | CONTROL={self._control_source()}"
+                    + (f" | TF unavailable {tf_failures}x" if tf_failures else ""))
+                return False
+            pose = self._robot_map_pose()
+            if pose is None:
+                tf_failures += 1
+                continue
+            dist = math.hypot(gx - pose[0], gy - pose[1])
+            if start_dist is None:
+                start_dist = dist
+            if dist <= ARRIVE_TOL:
+                self.get_logger().warn(f"[Yield] REACHED Y (dist={dist:.2f}m)")
+                return True
+        return False
 
-            def vw(t):
-                return (f"vx={t.linear.x:+.2f} wz={t.angular.z:+.2f}"
-                        if t is not None else "  --  ")
+    def _decide_resume_or_reyield(self):
+        """At yield goal Y: can we plan from here back to spot A?
+          - yes -> pedestrians cleared, resume original goal G (episode ends).
+          - no  -> still blocked; re-yield (pause+capture) unless MAX_YIELD_ROUNDS hit.
+        """
+        if self._pos_A is None:
+            self.get_logger().warn("[Resume] no spot-A recorded; forcing resume of G")
+            self._resume_original_goal()
+            return
 
-            # robot pose from odom (position + yaw) to compute heading error to goal
-            goal_str = "goalΔ=  n/a"
-            if self._odom is not None:
-                p = self._odom.pose.pose.position
-                q = self._odom.pose.pose.orientation
-                yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                                 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-                brg = math.atan2(gy - p.y, gx - p.x)
-                d = math.degrees((brg - yaw + math.pi) % (2 * math.pi) - math.pi)
-                rng = math.hypot(gx - p.x, gy - p.y)
-                goal_str = f"goalΔ={d:+6.1f}deg dist={rng:4.2f}m"
+        ax, ay = self._pos_A
+        can_back = self._can_plan_to(ax, ay)
+        self.get_logger().warn(
+            f"[Resume] path back to A=({ax:.2f},{ay:.2f})? -> {'YES' if can_back else 'NO'}")
 
-            plan_str = "plan→goal=n/a"
-            if self._plan is not None and self._plan.poses:
-                e = self._plan.poses[-1].pose.position
-                plan_str = f"plan_end→goal={math.hypot(gx - e.x, gy - e.y):4.2f}m"
+        if can_back:
+            self.get_logger().warn("[Resume] pedestrians cleared -> resuming original goal G")
+            self._resume_original_goal()
+        elif self._yield_round >= MAX_YIELD_ROUNDS:
+            self.get_logger().error(
+                f"[Resume] still blocked after {self._yield_round} yields (cap={MAX_YIELD_ROUNDS}); "
+                f"GIVING UP re-yield and force-resuming original goal G")
+            self._resume_original_goal()
+        else:
+            self.get_logger().warn(
+                f"[Re-yield] A still blocked; capturing again for round {self._yield_round + 1}")
+            # pause+capture -> Isaac publishes snapshot_ready -> _cb_snapshot_ready re-enters.
+            # _busy is cleared in the finally of this run; request AFTER we return so the next
+            # snapshot isn't dropped. Schedule via a tiny timer so this thread unwinds first.
+            self._pending_reyield = True
 
-            self.get_logger().info(
-                f"[Probe] CONTROL={self._control_source()} | "
-                f"cmd_nav[{vw(self._cmd_nav)}] | cmd_out[{vw(self._cmd_out)}] | "
-                f"odom[{vw(self._odom.twist.twist if self._odom else None)}] | "
-                f"{goal_str} | {plan_str}")
-        reason = "sim paused/frozen" if not self._sim_running else "superseded by new replan"
-        self.get_logger().warn(f"[Probe] stopped ({reason})")
+    def _resume_original_goal(self):
+        """End the yield episode: publish original goal G (if known) and reset state."""
+        if self._orig_goal_G is not None:
+            g = self._orig_goal_G
+            g.header.stamp = self.get_clock().now().to_msg()
+            self._goal_pub.publish(g)
+            self.get_logger().warn(
+                f"[Resume] published original goal G=({g.pose.position.x:.2f},"
+                f"{g.pose.position.y:.2f}); resuming normal navigation")
+        else:
+            self.get_logger().error("[Resume] original goal G unknown; cannot resume automatically")
+        self._yield_active = False
+        self._pos_A = None
+        self._yield_round = 0
+        self._publish_active(False)   # episode over -> proactive trigger may fire again
+
+    def _publish_active(self, active: bool):
+        """Latched flag: True for the whole yield episode (incl. re-yields) so the proactive
+        trigger won't fire another yield mid-episode."""
+        m = Bool()
+        m.data = bool(active)
+        self._active_pub.publish(m)
 
     def _call_unpause(self, timeout: float = 2.0) -> bool:
         if not self._unpause.service_is_ready():

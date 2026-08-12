@@ -75,7 +75,6 @@ def _resolve_person(goal_name: str) -> tuple[str, Person | None]:
     )
     return world_path(goal_name), None
 
-
 @on_exception(False)
 def navigate_pedestrian(goal: PedestrianGoal) -> bool:
     usd_path, person = _resolve_person(goal.name)
