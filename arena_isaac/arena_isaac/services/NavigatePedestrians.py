@@ -10,6 +10,11 @@ from isaacsim_msgs.srv import NavigatePedestrians
 from .utils import Service, on_exception
 
 _LOOK_AHEAD_M = 2.0
+_MIN_WALK_SPEED = 0.05   # below this hunav speed the agent counts as standing still
+# Planar gap past which the character walks even when hunav reports no motion, to correct
+# drift. Must exceed Person.update()'s 0.3 m pop-threshold.
+_CATCHUP_M = 0.4
+_CATCHUP_SPEED = 0.5
 
 @on_exception(False)
 def navigate_pedestrian(goal: PedestrianGoal) -> bool:
@@ -18,26 +23,39 @@ def navigate_pedestrian(goal: PedestrianGoal) -> bool:
     if not isinstance(person, Person):
         return False
 
-    hunav_pos = np.array([goal.position.x, goal.position.y, goal.position.z])
     current_pos = person.state.position  # updated by Person.update_state() every physics step
 
-    direction = hunav_pos - current_pos
-    dist = np.linalg.norm(direction)
+    # PLANAR only: hunav is 2D and sends z=0, while person.state.position carries the
+    # character's own z. A 3D norm mixed that offset into the distance and tilted the
+    # look-ahead target off the ground plane.
+    direction = np.array([goal.position.x, goal.position.y, 0.0]) - np.array(
+        [current_pos[0], current_pos[1], 0.0]
+    )
+    dist = float(np.linalg.norm(direction))
 
-    if dist < 0.01:
-        # Essentially stationary: clear queue so character idles
+    # Idle on what hunav REPORTS, not on proximity. The old `dist < 0.01` was finer than
+    # the 1 cm rounding hunav applies to the pose it sends, so quantisation noise read as
+    # "arrived" and froze the character mid-route while /people kept moving in RViz.
+    speed = float(getattr(goal, 'velocity', 0.8))
+    if speed < _MIN_WALK_SPEED and dist < _CATCHUP_M:
         person._target_positions.clear()
         return True
 
-    # Project _LOOK_AHEAD_M ahead in the hunav direction so the waypoint is
-    # always beyond Person.update()'s 0.3 m pop-threshold.
+    if dist < 1e-6:
+        return True   # no direction this cycle; leave the queue alone
+
+    if speed < _MIN_WALK_SPEED:
+        speed = _CATCHUP_SPEED   # catching up: Walk=0 would animate in place
+
+    # Project _LOOK_AHEAD_M ahead so the waypoint stays beyond Person.update()'s 0.3 m
+    # pop-threshold. direction has z=0, so the target keeps the character's own height.
     unit = direction / dist
     far_target = current_pos + unit * _LOOK_AHEAD_M
 
     person._target_positions.clear()
     person.update_target_positions(
         [[float(far_target[0]), float(far_target[1]), float(far_target[2])]],
-        getattr(goal, 'velocity', 0.8),
+        speed,
     )
     return True
 

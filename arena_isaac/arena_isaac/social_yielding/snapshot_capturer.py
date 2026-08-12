@@ -66,6 +66,13 @@ class SnapshotCapturer:
         """
         self._app = simulation_app
         self._snapshots_root = os.path.join(output_root, "snapshots")
+        # Monotonic capture counter. Render products are created with an explicit,
+        # never-recycled name (ArenaSnapshot<Tag>_<seq>) + force_new=True so they
+        # (a) never reuse/alias a resident pipeline's render product (e.g. the
+        # back-camera depth_pcl SDG pipeline), and (b) never collide with the
+        # auto-recycled "Replicator_NN" name slots. Both are the root cause of the
+        # "first capture works, later head captures return empty" bug.
+        self._seq = 0
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -86,6 +93,7 @@ class SnapshotCapturer:
         out_dir = self._make_out_dir()
         sys.stderr.write(f"[Snapshot]   out_dir={out_dir}\n")
         saved = {"head": False, "back": False, "topdown": False}
+        self._seq += 1  # unique, never-recycled render-product name suffix for this capture
 
         # IMPORTANT: create ALL render products first, warm up ONCE, then read.
         # Creating a render product, reading, and destroying it before creating
@@ -100,14 +108,15 @@ class SnapshotCapturer:
                     sys.stderr.write(
                         f"[Snapshot] {tag} camera path invalid, skipping: {cam_path}\n")
                     continue
-                rp = rep.create.render_product(cam_path, _HEAD_BACK_RES)
+                # Explicit unique name (=> force_new=True) so this render product
+                # never reuses/aliases the resident back-camera SDG render product,
+                # and its name is never recycled into the "Replicator_NN" churn that
+                # left later head captures reading a dead node (empty data).
+                rp_name = f"ArenaSnapshot{tag.capitalize()}_{self._seq}"
+                rp = rep.create.render_product(cam_path, _HEAD_BACK_RES, name=rp_name)
                 # Isaac 5.1: a freshly created render product is lazy — its hydra
                 # texture / OmniGraph nodes are not built until the app pumps
-                # frames. Attaching an annotator immediately fails inside
-                # activate_node_template ("Annotator rgb is not attached to any
-                # render products"), and this got worse once the back camera added
-                # a second resident SDG pipeline. Pump several updates so the RP is
-                # real before attaching (one update was not enough).
+                # frames. Pump several updates so the RP is real before attaching.
                 for _ in range(_WARMUP_STEPS):
                     self._app.update()
                 rgb_a = rep.AnnotatorRegistry.get_annotator("rgb")
@@ -267,10 +276,12 @@ class SnapshotCapturer:
             sys.stderr.write(
                 f"[Snapshot] topdown: world_pos={cam_world_pos}, rotation=identity (look -Z / down)\n")
 
-            rp = rep.create.render_product(cam_path, _TOPDOWN_RES)
+            # Explicit unique name (=> force_new=True); never recycled / never
+            # aliases a resident render product (see head/back path).
+            rp = rep.create.render_product(
+                cam_path, _TOPDOWN_RES, name=f"ArenaSnapshotTopdown_{self._seq}")
             # Isaac 5.1: pump several frames so the lazily-created render product
-            # is real before attaching the annotator (see head/back path; one
-            # frame was not enough with the back camera's SDG pipeline resident).
+            # is real before attaching the annotator.
             for _ in range(_WARMUP_STEPS):
                 self._app.update()
             rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")

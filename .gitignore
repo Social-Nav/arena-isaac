@@ -19,3 +19,6 @@ arena_isaac/output/
 
 # local data-collection runner (not shared)
 arena_isaac/arena_isaac/run_single_collection.sh
+
+# reference copy of the removed blockage-rule trigger (not imported, kept for restore/A-B)
+arena_isaac/arena_isaac/social_yielding/_blockage_rules_backup.py

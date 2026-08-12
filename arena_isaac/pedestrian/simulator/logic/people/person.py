@@ -1,4 +1,5 @@
 # Low level APIs
+import math
 import os
 from collections import deque
 
@@ -274,10 +275,16 @@ class Person:
         # Set the initial position and orientation of the person
         self.prim.GetAttribute("xformOp:translate").Set(Gf.Vec3d(float(init_pos[0]), float(init_pos[1]), float(init_pos[2])))
 
+        # Gf.Rotation(axis, angle) takes the angle in DEGREES, but init_yaw is RADIANS
+        # (see the constructor docstring, and _state.orientation above which builds the
+        # same rotation with degrees=False). Passing radians straight through shrank every
+        # spawn heading by 180/pi -- a scenario's 88.81 deg became 1.55 deg, i.e. every
+        # pedestrian spawned facing ~+x no matter what the scenario asked for.
+        yaw_deg = math.degrees(float(init_yaw))
         if type(self.prim.GetAttribute("xformOp:orient").Get()) == Gf.Quatf:
-            self.prim.GetAttribute("xformOp:orient").Set(Gf.Quatf(Gf.Rotation(Gf.Vec3d(0, 0, 1), float(init_yaw)).GetQuat()))
+            self.prim.GetAttribute("xformOp:orient").Set(Gf.Quatf(Gf.Rotation(Gf.Vec3d(0, 0, 1), yaw_deg).GetQuat()))
         else:
-            self.prim.GetAttribute("xformOp:orient").Set(Gf.Rotation(Gf.Vec3d(0, 0, 1), float(init_yaw)).GetQuat())
+            self.prim.GetAttribute("xformOp:orient").Set(Gf.Rotation(Gf.Vec3d(0, 0, 1), yaw_deg).GetQuat())
 
         # Get the Skeleton root of the character
         self.character_skel_root, root_path = Person._transverse_prim(self._current_stage, self._stage_prefix)
