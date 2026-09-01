@@ -53,6 +53,7 @@ import numpy as np
 # === END ROBUST AUTO-FIX ===
 
 import os
+import re
 import sys
 import json
 import time
@@ -91,17 +92,53 @@ try:
 except ImportError:
     HAS_MCAP = False
 
+
+# ─────────────────────────────────────────────────────────────────────────────────────
+# CAPTURE RESOLUTION -- must match the Isaac camera the data is collected from.
+#
+# Used three times: to size both render products (initial + reset) and as the
+# width/height that process_camera_data() turns cameraProjection into pixel
+# intrinsics. Those must be the SAME numbers, so keep it a single constant: a
+# render product at one size with intrinsics computed at another yields fx/fy/cx/cy
+# that are silently wrong for the images actually written.
+CAPTURE_WIDTH = 640
+CAPTURE_HEIGHT = 480
+# ─────────────────────────────────────────────────────────────────────────────────────
+
 class DataLoggerReplicator:
     """Replicator-based dataset logger using Isaac Sim annotators."""
     
-    def __init__(self, camera_prim_path, pedestrian_root_path, lidar_prim_path, output_dir="collected_data"):
+    def __init__(self, camera_prim_path, pedestrian_root_path, lidar_prim_path,
+                 output_dir="collected_data", robot_name="jackal",
+                 fps=None, world=None):
         """Initialize logger.
-        
+
         Args:
             camera_prim_path: Camera prim path in USD stage
             pedestrian_root_path: Pedestrian root prim path
             lidar_prim_path: LIDAR prim path
-            output_dir: Output directory for saving data
+            output_dir: Output directory for saving data (default: collected_data)
+            robot_name: Robot model name, used for the MCAP frame_id and topic. Defaults to
+                "jackal" only to preserve the old behaviour for callers that do not pass it;
+                run_isaacsim always does.
+            fps: Capture rate in Hz, in sim time. None (default) captures every rendered
+                frame, i.e. the full render rate (60 Hz with World() defaults).
+
+                Capture happens once per world.step(render=True), so the rate is reached
+                by keeping 1 frame in N — N integer. Only exact divisors of the render
+                rate are therefore achievable: at 60 Hz rendering, 60/30/20/15/12/10 Hz
+                are exact, and anything else rounds to the nearest one (25 -> 30, 40 ->
+                30). The resolved rate is stored in self.fps and logged at startup; read
+                that rather than assuming the requested value was honoured.
+
+                Must match the --fps passed to postprocess/process_raw_to_dataset.py, or
+                preview mp4 playback speed will not match sim time.
+            world: The --world launch argument (e.g. grscenes_1). When set, output_dir is
+                treated as the grscenes root and everything lands in
+                    <output_dir>/<world>/{data,meta,videos}/
+                with no scenario or timestamp level in between, so re-running the same
+                world appends episodes to one dataset instead of forking a new tree.
+                When None, falls back to a timestamped session dir under output_dir.
         """
         
         if not is_prim_path_valid(camera_prim_path):
@@ -111,30 +148,88 @@ class DataLoggerReplicator:
 
         self.output_dir = output_dir
         self.camera_prim_path = camera_prim_path
+        # Derived once so the frame_id and the lidar topic can never disagree with each other.
+        self.robot_name = robot_name
+        self.base_frame = f"{robot_name}/base_link"
 
-        # Create timestamped session dir only when logger is instantiated (save_data=true)
-        import datetime
-        beijing_time = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-        session_name = beijing_time.strftime("%Y-%m-%d_%H-%M-%S")
-        self.session_dir = os.path.join(output_dir, session_name)
-        old_umask = os.umask(0)
-        os.makedirs(self.session_dir, mode=0o777, exist_ok=True)
-        os.umask(old_umask)
+        # Create directory structure keyed on the --world launch argument.
+        self.world = world
+        if world:
+            # <output_dir>/<world>/{data,meta,videos}/ -- output_dir is the grscenes root.
+            # No scenario level and no timestamp: one world == one dataset, so a second
+            # run of the same world continues numbering into the same three dirs.
+            self.scene_root = os.path.join(output_dir, world)
+            self.data_dir = os.path.join(self.scene_root, "data")
+            self.meta_dir = os.path.join(self.scene_root, "meta")
+            self.videos_dir = os.path.join(self.scene_root, "videos")
 
-        self.episode_idx = 0
+            old_umask = os.umask(0)
+            os.makedirs(self.data_dir, mode=0o777, exist_ok=True)
+            os.makedirs(self.meta_dir, mode=0o777, exist_ok=True)
+            os.makedirs(self.videos_dir, mode=0o777, exist_ok=True)
+            os.umask(old_umask)
+
+            # Episode numbering continues past whatever is already on disk, so a rerun of
+            # the same world does not overwrite earlier episodes.
+            self.episode_idx = self._next_episode_idx(self.data_dir)
+
+            self.session_dir = self.scene_root
+            sys.stderr.write(f"[Logger] World-based structure: {self.scene_root}\n")
+            sys.stderr.write(f"  Data   → {self.data_dir}   (episode_XXXXXX.json)\n")
+            sys.stderr.write(f"  Videos → {self.videos_dir} (episode_XXXXXX_N.npy)\n")
+            sys.stderr.write(f"  Meta   → {self.meta_dir}\n")
+            if self.episode_idx:
+                sys.stderr.write(
+                    f"[Logger] {self.episode_idx} existing episode(s), resuming at "
+                    f"episode_{self.episode_idx:06d}.\n")
+        else:
+            # Legacy structure: timestamped session dir
+            import datetime
+            beijing_time = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+            session_name = beijing_time.strftime("%Y-%m-%d_%H-%M-%S")
+            self.session_dir = os.path.join(output_dir, session_name)
+            old_umask = os.umask(0)
+            os.makedirs(self.session_dir, mode=0o777, exist_ok=True)
+            os.umask(old_umask)
+            self.scene_root = self.session_dir
+            self.data_dir = self.session_dir  # parquet in episode dirs
+            self.videos_dir = self.session_dir  # videos in episode dirs
+            self.meta_dir = self.session_dir  # meta in session root
+            sys.stderr.write(f"[Logger] Legacy structure: {self.session_dir}\n")
+            self.episode_idx = 0
+
+        # NOTE: episode_idx is set by both branches above (the world branch resumes past
+        # existing episodes), so it must not be reset here.
         self.param_buffer = []
         self.rgb_frame_buffer = []
         self.depth_frame_buffer = []
         self._stream_chunk_idx = 0
+        # Frame index within the current episode, for the flat videos/ naming. Kept
+        # separate from _stream_chunk_idx so names stay continuous across chunk flushes.
+        self._frame_write_idx = 0
         self._pending_saves = []
         self._skip_frames_after_rebuild = 0  # warmup ticks after a rebuild
 
+        # Requested capture rate -> integer decimation against the render rate.
+        # step() runs once per world.step(render=True), so the fastest achievable
+        # rate is the render rate itself; fps above that is clamped to it.
+        render_hz = self._get_render_hz()
+        self.fps = render_hz if fps is None else float(fps)
+        self._capture_decimation = max(1, round(render_hz / self.fps))
+        self.fps = render_hz / self._capture_decimation  # actual, after rounding
+        # Counts every step() call that reaches the gate; the modulo test is against
+        # this, so the capture phase stays stable across episodes.
+        self._step_call_count = 0
+        sys.stderr.write(
+            f"[Logger] Capture {self.fps:.1f} Hz "
+            f"(every {self._capture_decimation} of {render_hz:.0f} Hz rendering).\n")
+
         # Create render product for camera
-        self.camera_rp = rep.create.render_product(camera_prim_path, (1280, 720))
+        self.camera_rp = rep.create.render_product(camera_prim_path, (CAPTURE_WIDTH, CAPTURE_HEIGHT))
         
         # Register annotators
         self.rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
-        self.depth_annot = rep.AnnotatorRegistry.get_annotator("distance_to_camera")
+        self.depth_annot = rep.AnnotatorRegistry.get_annotator("distance_to_image_plane")
         self.cam_params_annot = rep.AnnotatorRegistry.get_annotator("camera_params")
 
         # Attach camera data
@@ -202,13 +297,13 @@ class DataLoggerReplicator:
         self.record_process = None
         self._start_rosbag_record()'''
 
-    def json_write_points(self, points, sim_time, frame_id="jackal/base_link"):
-        """Write point cloud data to JSON format."""
+    def json_write_points(self, points, sim_time, frame_id=None):
+        """Write point cloud data to JSON format. frame_id defaults to this robot's base frame."""
         points_list = points.tolist()
-        
+
         data = {
             "points": points_list,
-            "frame_id": frame_id,
+            "frame_id": frame_id if frame_id is not None else self.base_frame,
             "timestamp": sim_time
         }
         
@@ -239,9 +334,9 @@ class DataLoggerReplicator:
             self._lidar_ros_writer = Ros2Writer(self._lidar_file)
 
             self._lidar_channel_id = self._lidar_ros_writer.register_msg_channel(
-                    topic="/jackal/lidar_points",
+                    topic=f"/{self.robot_name}/lidar_points",
                     msg_type="sensor_msgs/msg/PointCloud2",
-                    frame_id="jackal/base_link"
+                    frame_id=self.base_frame
                 )
             self._lidar_writer = self._lidar_ros_writer
             # self._lidar_writer = Writer(self._lidar_file)
@@ -297,7 +392,7 @@ class DataLoggerReplicator:
             points_f32 = points.astype(np.float32)
             
             header = Header()
-            header.frame_id = "jackal/base_link"  
+            header.frame_id = self.base_frame
             
             seconds = int(sim_time)
             nanoseconds = int((sim_time - seconds) * 1e9)
@@ -309,8 +404,10 @@ class DataLoggerReplicator:
             serialized_msg = serialize_message(msg)
 
             ns_time = int(sim_time * 1e9)
+            # Must match the topic registered in register_msg_channel above, hence the same
+            # derivation rather than a second literal.
             self._lidar_ros_writer.write_message(
-            topic="/jackal/lidar_points",
+            topic=f"/{self.robot_name}/lidar_points",
             message=msg,
             log_time=ns_time,
             publish_time=ns_time
@@ -486,6 +583,16 @@ class DataLoggerReplicator:
         # So the last column is translation [x, y, z, 1]
         pose_matrix_col_major = pose_matrix_row_major.T
         
+        # OpenGL/USD -> ROS optical convention. Isaac cameras look down -Z with +Y up; ROS
+        # (REP-103) uses +Z forward with +Y down. Without this the extrinsics disagree with
+        # observation.peds_state, which comes from get_world_poses() and is already ROS-compatible
+        # USD world -- so the two could not be composed even though both are "world frame".
+        #
+        # RIGHT-multiply: the 3x3 columns are the camera's own axes, and we are relabelling those
+        # axes, not moving the world. Left-multiplying would rotate the world instead and put the
+        # camera in the wrong place. Translation is untouched either way, which is the sanity check.
+        pose_matrix_col_major = pose_matrix_col_major @ np.diag([1.0, -1.0, -1.0, 1.0])
+
         # [Clean] keep 6 decimals (enough for navigation precision, turns 1e-19 to 0)
         # This maps 0.9999999 -> 1.0, 1.2e-19 -> 0.0
         pose_clean = np.round(pose_matrix_col_major, decimals=6)
@@ -501,9 +608,21 @@ class DataLoggerReplicator:
         fx = proj_4x4[0, 0] * width / 2.0
         fy = proj_4x4[1, 1] * height / 2.0
 
-        # Principal point is usually at the image center
-        cx = width / 2.0
-        cy = height / 2.0
+        # Principal point FROM the projection matrix, not assumed to be the image centre.
+        # It only equals the centre when the camera has no aperture offset; set
+        # horizontal/vertical_aperture_offset on the USD camera and the centre assumption puts
+        # cx/cy tens of pixels off, which silently breaks any reprojection while the image still
+        # looks fine. fx/fy are on the diagonal so they are unaffected by this.
+        #
+        # The offsets live off-diagonal, and which slot depends on whether Isaac hands us the
+        # matrix row- or column-major (the pose above is row-major, but that is not guaranteed to
+        # hold for cameraProjection). Reading whichever slot is populated makes this correct under
+        # either convention instead of silently reading a structural zero.
+        off_x = proj_4x4[2, 0] if proj_4x4[2, 0] != 0.0 else proj_4x4[0, 2]
+        off_y = proj_4x4[2, 1] if proj_4x4[2, 1] != 0.0 else proj_4x4[1, 2]
+        # NDC -> pixels. y flips because NDC is +up while pixel rows go +down.
+        cx = (1.0 + off_x) * width / 2.0
+        cy = (1.0 - off_y) * height / 2.0
 
         # Build standard 3x3 intrinsics K
         K = np.array([
@@ -519,29 +638,48 @@ class DataLoggerReplicator:
 
         return pose_clean.flatten().tolist(), K_clean.flatten().tolist()
 
-    def process_depth_for_video(self, depth_data, max_dist=30.0):
+    def process_depth_for_png(self, depth_data, max_dist=65.535):
+        """Convert float32 planar depth to uint16 millimetres for lossless PNG.
+
+        Uses distance_to_image_plane annotator: the z-coordinate in camera frame
+        (perpendicular distance from the camera's XY plane), NOT the Euclidean
+        distance from camera origin to 3D point. The distinction matters for:
+
+        1. Reprojection (pinhole camera model):
+              X = (u - cx) * Z / fx
+              Y = (v - cy) * Z / fy
+           requires Z = planar depth, not radial distance.
+
+        2. Occlusion testing (e.g. gen_pixel_goal_labels.py line 211):
+              if np.linalg.norm(p_cam[:3]) > measured + margin:
+           When both sides are planar depth Z, the comparison is Z_target vs Z_pixel.
+           At image edges, radial distance r exceeds planar depth Z significantly:
+
+           | Location      | r/Z ratio | Example: Z=5m -> r= |
+           |---------------|-----------|---------------------|
+           | Image center  | 1.00      | 5.0 m (negligible)  |
+           | Edge midpoint | 1.41      | 7.1 m (+41%)        |
+           | Corner        | 1.52      | 7.6 m (+52%)        |
+
+           The margin parameter (default 0.5 m) tolerates this mismatch near center,
+           but extreme corners can still trigger false occlusions if radial distance
+           was used. If occlusion failures cluster at image edges, either widen
+           margin or verify the annotator is distance_to_image_plane, not
+           distance_to_camera.
+
+        Args:
+            depth_data: (H, W) float32, planar depth in metres from distance_to_image_plane.
+            max_dist: Clipping ceiling in metres. 65.535 = uint16 max at 1 mm scale.
+
+        Returns:
+            (H, W) uint16, millimetres. 0 = invalid (NaN/inf in input), not zero distance.
+            Downstream must check `depth[v, u] <= 0` to skip invalid pixels.
         """
-        Convert float32 depth map to uint8 RGB suitable for video
-        """
-        # 1. Replace Inf (sky) with max distance, NaN with 0
         depth_data = np.nan_to_num(depth_data, nan=0.0, posinf=max_dist, neginf=0.0)
-        
-        # 2. Clip range to [0, max_dist]
         depth_data = np.clip(depth_data, 0, max_dist)
-        
-        # 3. Linear mapping: [0, max_dist] -> [0, 255]
-        # Note: if you want near = black, far = white, use this; otherwise use 255 - (...)
-        depth_norm = (depth_data / max_dist) * 255.0
-        
-        # 4. Convert dtype to uint8
-        depth_uint8 = depth_norm.astype(np.uint8)
-        
-        # 5. Video encoders usually prefer 3-channel data
-        # Stack (H, W) to (H, W, 3) grayscale
-        depth_rgb = np.stack([depth_uint8] * 3, axis=-1)
-    
-        return depth_rgb
-    
+        depth_mm = (depth_data * 1000.0).astype(np.uint16)
+        return depth_mm  # (H, W) single channel
+
     def get_pedestrian_state(self):
         """
         Return all pedestrians' 4x4 matrices. If not initialized, try dynamic init.
@@ -583,6 +721,23 @@ class DataLoggerReplicator:
             
         return curr_peds_dict
     
+    @staticmethod
+    def _get_render_hz(default: float = 60.0) -> float:
+        """Render rate in Hz, read from the live SimulationContext.
+
+        Read rather than hardcoded so the capture rate stays correct if rendering_dt is
+        ever changed. Falls back to `default` if the context is not up yet or the stage
+        is not open, in which case get_rendering_dt raises.
+        """
+        try:
+            dt = SimulationContext.instance().get_rendering_dt()
+            if dt and dt > 0.0:
+                return 1.0 / dt
+            sys.stderr.write(f"[Logger] rendering_dt={dt!r}, assuming {default:.0f} Hz.\n")
+        except Exception as e:
+            sys.stderr.write(f"[Logger] Could not read rendering_dt ({e}), assuming {default:.0f} Hz.\n")
+        return default
+
     def reset_render_product(self, warmup_frames: int = 60):
         """Rebuild render product and annotators after robot respawn.
 
@@ -600,9 +755,9 @@ class DataLoggerReplicator:
                 self.camera_rp.destroy()
             except Exception:
                 pass
-            self.camera_rp = rep.create.render_product(self.camera_prim_path, (1280, 720))
+            self.camera_rp = rep.create.render_product(self.camera_prim_path, (CAPTURE_WIDTH, CAPTURE_HEIGHT))
             self.rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
-            self.depth_annot = rep.AnnotatorRegistry.get_annotator("distance_to_camera")
+            self.depth_annot = rep.AnnotatorRegistry.get_annotator("distance_to_image_plane")
             self.cam_params_annot = rep.AnnotatorRegistry.get_annotator("camera_params")
             self.rgb_annot.attach(self.camera_rp)
             self.depth_annot.attach(self.camera_rp)
@@ -617,19 +772,29 @@ class DataLoggerReplicator:
         Call this after env.step()
         """
 
-        # Warmup skip after annotator rebuild — give the renderer time to settle
+        # Warmup skip after annotator rebuild — give the renderer time to settle.
+        # Counted in rendered frames (every step() call), before decimation, since
+        # it is the renderer that needs to settle, not the dataset.
         if self._skip_frames_after_rebuild > 0:
             self._skip_frames_after_rebuild -= 1
             if self._skip_frames_after_rebuild == 0:
                 sys.stderr.write(f"[Logger] Warmup complete, resuming data capture.\n")
             return
 
+        # Capture decimation: with _capture_decimation == 1 this is always on-phase,
+        # so the default path is unchanged.
+        on_phase = (self._step_call_count % self._capture_decimation) == 0
+        self._step_call_count += 1
+        if not on_phase:
+            return
+
         # Pre-init variables to avoid UnboundLocalError
         rgb = None
         params = None
         curr_ped_pos = None
-        width = 1280 # resolution you set
-        height = 720
+        # Same constant that sized the render product above -- see CAPTURE_WIDTH.
+        width = CAPTURE_WIDTH
+        height = CAPTURE_HEIGHT
 
         # Try to get camera data
         try:
@@ -661,14 +826,23 @@ class DataLoggerReplicator:
         # Process RGB (remove alpha channel)
         if rgb.shape[2] == 4:
             rgb = rgb[..., :3]
-        # Process depth: convert to 0-255 uint8 RGB (beyond 10m is white)
-        if depth is not None and depth.size > 0:
-            depth_processed = self.process_depth_for_video(depth, max_dist=10.0)
-        
+        # Process depth: quantise to uint16 millimetres (1 mm precision, 0-65.5 m range).
+        # The None check above does not cover an empty array, and depth_processed is
+        # appended unconditionally below — so bail on the whole frame rather than let
+        # it reach the append with depth_processed unbound. Skipping the frame (not
+        # just the depth) is what keeps rgb/depth/param buffers index-aligned; losing
+        # one of the three would silently desync frame_index from the images.
+        if depth.size == 0:
+            sys.stderr.write("[Logger] Empty depth array, skipping frame.\n")
+            return
+        depth_processed = self.process_depth_for_png(depth, max_dist=65.535)
+
         try:
+            # params was already fetched above; re-calling get_data() here was a second
+            # annotator round-trip per frame for the same data.
             pose_list, intrinsics_list = self.process_camera_data(
-                self.cam_params_annot.get_data(),
-                width, 
+                params,
+                width,
                 height
             )
 
@@ -682,7 +856,13 @@ class DataLoggerReplicator:
             self.rgb_frame_buffer.append(rgb)
             self.depth_frame_buffer.append(depth_processed)
             self.param_buffer.append({
-                "frame_index": step_idx, 
+                # Position in this episode's buffer, NOT the caller's step_idx: that one
+                # counts every step() call including the ones decimation and warmup drop,
+                # which would leave gaps (0, 2, 4, ...) here. param_buffer is appended
+                # once per captured frame and only reset per episode (the mid-episode
+                # chunk flush clears the image buffers, not this one), so its length is
+                # the captured-frame count and needs no separate counter.
+                "frame_index": len(self.param_buffer),
                 "observation.camera_intrin": intrinsics_list,
                 "observation.camera_state": pose_list,
                 "observation.peds_state": curr_ped_pos,
@@ -733,30 +913,77 @@ class DataLoggerReplicator:
         self.depth_frame_buffer = []
         self._stream_chunk_idx += 1
 
-        ep_dir = os.path.join(self.session_dir, f"episode_{ep_idx:02d}")
-        old_umask = os.umask(0)
-        os.makedirs(os.path.join(ep_dir, "rgb_videos"),   mode=0o777, exist_ok=True)
-        os.makedirs(os.path.join(ep_dir, "depth_videos"), mode=0o777, exist_ok=True)
-        os.umask(old_umask)
+        if self.world:
+            # Flat layout: one npy per frame, directly under videos/, no subdirs.
+            #   videos/episode_XXXXXX_N.npy   -- N is the frame index within the episode
+            # Each file holds both modalities in one dict, because the filename carries no
+            # rgb/depth discriminator. Postprocess splits it into rgb PNG + depth PNG.
+            # Frame numbering is continuous across chunk flushes (see _frame_write_idx).
+            out_dir = self.videos_dir
+            start_idx = self._frame_write_idx
+            self._frame_write_idx += len(rgb_frames)
 
-        rgb_path   = os.path.join(ep_dir, "rgb_videos",   f"chunk_{chunk_idx:04d}.npy")
-        depth_path = os.path.join(ep_dir, "depth_videos", f"chunk_{chunk_idx:04d}.npy")
-
-        sys.stderr.write(f"[Flush] ep={ep_idx:02d} chunk={chunk_idx:04d} ({len(rgb_frames)} frames)\n")
-        sys.stderr.flush()
-
-        def _write():
-            try:
-                np.save(rgb_path,   np.stack(rgb_frames))
-                np.save(depth_path, np.stack(depth_frames))
-                sys.stderr.write(f"[Flush] chunk {ep_idx:02d}/{chunk_idx:04d} saved.\n")
-            except Exception as e:
-                sys.stderr.write(f"[Flush] chunk {ep_idx:02d}/{chunk_idx:04d} failed: {e}\n")
+            sys.stderr.write(
+                f"[Flush] ep={ep_idx:06d} frames {start_idx}..{start_idx + len(rgb_frames) - 1}\n")
             sys.stderr.flush()
+
+            def _write():
+                try:
+                    for i, (rgb, depth) in enumerate(zip(rgb_frames, depth_frames)):
+                        np.save(
+                            os.path.join(out_dir, f"episode_{ep_idx:06d}_{start_idx + i}.npy"),
+                            {"rgb": rgb, "depth": depth},
+                            allow_pickle=True,
+                        )
+                    sys.stderr.write(
+                        f"[Flush] ep {ep_idx:06d}: {len(rgb_frames)} frame npy saved.\n")
+                except Exception as e:
+                    sys.stderr.write(f"[Flush] ep {ep_idx:06d} frame write failed: {e}\n")
+                sys.stderr.flush()
+        else:
+            # Legacy layout: chunked npy under per-episode rgb_videos/ + depth_videos/.
+            ep_dir = os.path.join(self.videos_dir, f"episode_{ep_idx:02d}")
+            old_umask = os.umask(0)
+            os.makedirs(os.path.join(ep_dir, "rgb_videos"),   mode=0o777, exist_ok=True)
+            os.makedirs(os.path.join(ep_dir, "depth_videos"), mode=0o777, exist_ok=True)
+            os.umask(old_umask)
+
+            rgb_path   = os.path.join(ep_dir, "rgb_videos",   f"chunk_{chunk_idx:04d}.npy")
+            depth_path = os.path.join(ep_dir, "depth_videos", f"chunk_{chunk_idx:04d}.npy")
+
+            sys.stderr.write(f"[Flush] ep={ep_idx:02d} chunk={chunk_idx:04d} ({len(rgb_frames)} frames)\n")
+            sys.stderr.flush()
+
+            def _write():
+                try:
+                    np.save(rgb_path,   np.stack(rgb_frames))
+                    np.save(depth_path, np.stack(depth_frames))
+                    sys.stderr.write(f"[Flush] chunk {ep_idx:02d}/{chunk_idx:04d} saved.\n")
+                except Exception as e:
+                    sys.stderr.write(f"[Flush] chunk {ep_idx:02d}/{chunk_idx:04d} failed: {e}\n")
+                sys.stderr.flush()
 
         t = threading.Thread(target=_write, daemon=True, name=f"flush-ep{ep_idx}-ch{chunk_idx}")
         self._pending_saves.append(t)
         t.start()
+
+    @staticmethod
+    def _next_episode_idx(data_dir):
+        """Highest episode_XXXXXX.json in data_dir, plus one (0 if none).
+
+        Lets a second run of the same --world append instead of clobbering, since the
+        world dir has no timestamp level to keep runs apart.
+        """
+        try:
+            names = os.listdir(data_dir)
+        except OSError:
+            return 0
+        indices = [
+            int(m.group(1))
+            for m in (re.match(r"episode_(\d+)\.json$", n) for n in names)
+            if m
+        ]
+        return max(indices) + 1 if indices else 0
 
     def save_episode(self):
         """
@@ -782,11 +1009,17 @@ class DataLoggerReplicator:
         self.param_buffer = []
         self._stream_chunk_idx = 0
 
-        ep_dir = os.path.join(self.session_dir, f"episode_{episode_idx:02d}")
-        old_umask = os.umask(0)
-        os.makedirs(os.path.join(ep_dir, "data"), mode=0o777, exist_ok=True)
-        os.umask(old_umask)
-        json_path = os.path.join(ep_dir, "data", "params.json")
+        if self.world:
+            # One json per episode, flat under data/. Postprocess turns each of these into
+            # the matching data/chunk-XXX/episode_XXXXXX.parquet.
+            self._frame_write_idx = 0  # next episode restarts frame numbering
+            json_path = os.path.join(self.data_dir, f"episode_{episode_idx:06d}.json")
+        else:
+            ep_data_dir = os.path.join(self.data_dir, f"episode_{episode_idx:02d}")
+            old_umask = os.umask(0)
+            os.makedirs(ep_data_dir, mode=0o777, exist_ok=True)
+            os.umask(old_umask)
+            json_path = os.path.join(ep_data_dir, "params.json")
 
         def _write():
             try:
@@ -825,19 +1058,47 @@ class DataLoggerReplicator:
             t.join(timeout=10.0)
         self._pending_saves = [t for t in self._pending_saves if t.is_alive()]
 
-        # Delete all files under the episode directory
         deleted = 0
-        for subdir in ("rgb_videos", "depth_videos", "data"):
-            subdir_path = os.path.join(ep_dir, subdir)
-            if not os.path.isdir(subdir_path):
-                continue
-            for fname in os.listdir(subdir_path):
-                fpath = os.path.join(subdir_path, fname)
+        if self.world:
+            # World layout: frames are flat under videos/ as episode_XXXXXX_N.npy and the
+            # params json is flat under data/. The legacy per-episode subdirs below do not
+            # exist here, so without this branch a discarded episode left every frame it
+            # had already flushed on disk -- orphans that postprocess would later trip on.
+            frame_pat = re.compile(rf"episode_{ep_idx:06d}_\d+\.npy$")
+            try:
+                for fname in os.listdir(self.videos_dir):
+                    if frame_pat.match(fname):
+                        try:
+                            os.remove(os.path.join(self.videos_dir, fname))
+                            deleted += 1
+                        except Exception as e:
+                            sys.stderr.write(f"[Discard] Failed to delete {fname}: {e}\n")
+            except OSError as e:
+                sys.stderr.write(f"[Discard] Could not list {self.videos_dir}: {e}\n")
+            # A json for this slot only exists if a PREVIOUS attempt at this episode index
+            # got as far as save_episode(); the current attempt has not written one yet
+            # (params are held in memory until then). Remove it so the retry starts clean.
+            if os.path.exists(json_path := os.path.join(
+                    self.data_dir, f"episode_{ep_idx:06d}.json")):
                 try:
-                    os.remove(fpath)
+                    os.remove(json_path)
                     deleted += 1
                 except Exception as e:
-                    sys.stderr.write(f"[Discard] Failed to delete {fpath}: {e}\n")
+                    sys.stderr.write(f"[Discard] Failed to delete {json_path}: {e}\n")
+            self._frame_write_idx = 0   # next attempt restarts frame numbering
+        else:
+            # Legacy layout: everything lives under the per-episode dir.
+            for subdir in ("rgb_videos", "depth_videos", "data"):
+                subdir_path = os.path.join(ep_dir, subdir)
+                if not os.path.isdir(subdir_path):
+                    continue
+                for fname in os.listdir(subdir_path):
+                    fpath = os.path.join(subdir_path, fname)
+                    try:
+                        os.remove(fpath)
+                        deleted += 1
+                    except Exception as e:
+                        sys.stderr.write(f"[Discard] Failed to delete {fpath}: {e}\n")
 
         self._stream_chunk_idx = 0
         # Do NOT advance episode_idx — next attempt reuses the same slot

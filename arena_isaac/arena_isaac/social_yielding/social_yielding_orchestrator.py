@@ -68,6 +68,21 @@ MAX_YIELD_ROUNDS = 5       # safety valve: after this many consecutive yields, f
 # fire another yield mid-episode (incl. while re-yielding). Published by orchestrator.
 YIELD_ACTIVE_TOPIC = "social_yielding/active"
 
+# Keep the snapshot dir on disk after the replan has read it, or delete it.
+#
+# This is deliberately NOT a "don't capture" switch: the replan pipeline reads the
+# snapshot back off disk (selector loads the PNGs, pixel_to_map loads
+# <cam>_depth.npy + <cam>_camera.json), so a capture that never lands is a yield
+# that cannot happen. The only safe thing to make optional is the retention after
+# step 4 published the goal, which is when nothing reads the dir any more.
+#
+# Default false: a long collection run yields many times and each yield leaves three
+# PNGs + a depth npy, which is pure growth once the replan has consumed them. Set
+# ARENA_SAVE_SNAPSHOTS=true when debugging the yield pipeline -- the snapshot is the
+# only record of what the LLM actually saw when it picked a goal.
+SAVE_SNAPSHOTS = os.environ.get("ARENA_SAVE_SNAPSHOTS", "false").strip().lower() in (
+    "true", "1", "yes", "on")
+
 # Goal validation: reject a candidate goal whose global-costmap cell cost is >= this.
 # nav2 raw costs: 254=LETHAL, 253=INSCRIBED (inside robot radius of an obstacle),
 # 1..252=inflation gradient, 0=free, 255=unknown. 253 rejects goals the planner
@@ -154,7 +169,7 @@ class SocialReplanOrchestrator(Node):
 
         self.get_logger().info(
             f"SocialReplanOrchestrator ready | robot={ROBOT} | listening {SNAPSHOT_READY_TOPIC} "
-            f"| goal -> {GOAL_TOPIC}")
+            f"| goal -> {GOAL_TOPIC} | save_snapshots={SAVE_SNAPSHOTS}")
 
     def _cb_task_reset(self, msg: Int16):
         """Abandon the current yield episode; the new task owns the robot now."""
@@ -517,11 +532,39 @@ class SocialReplanOrchestrator(Node):
             traceback.print_exc()
         finally:
             self._busy = False
+            # Snapshot retention. Safe here and only here: every reader of the dir
+            # (selector, pixel_to_map) ran inside the try above, so by now it is dead
+            # weight. Deleting it earlier would break the re-yield path, which needs a
+            # readable dir for each round.
+            self._discard_snapshot(snapshot_dir)
             # If A was still blocked, trigger the next yield now that _busy is clear
             # (pause+capture -> Isaac publishes snapshot_ready -> _cb_snapshot_ready re-enters).
             if self._pending_reyield:
                 self._pending_reyield = False
                 self._request_pause_and_capture()
+
+    def _discard_snapshot(self, snapshot_dir: str):
+        """Delete the snapshot dir unless SAVE_SNAPSHOTS. Never raises.
+
+        Failing to clean up must not take down a yield episode, so this logs and moves
+        on. The rmtree is scoped to a dir that is named after the timestamp the capturer
+        made and that we only ever learn about via snapshot_ready.
+        """
+        if SAVE_SNAPSHOTS:
+            return
+        import shutil
+        try:
+            d = Path(snapshot_dir)
+            # Only remove what the capturer made: a dir directly under a "snapshots" parent.
+            # Guards against wiping something else if snapshot_ready ever carries a bad path.
+            if d.is_dir() and d.parent.name == "snapshots":
+                shutil.rmtree(d)
+                self.get_logger().info(f"[Snapshot] discarded {d} (ARENA_SAVE_SNAPSHOTS=false)")
+            else:
+                self.get_logger().warn(
+                    f"[Snapshot] refusing to discard unexpected path (not <...>/snapshots/<stamp>): {d}")
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warn(f"[Snapshot] could not discard {snapshot_dir}: {e}")
 
     def _drive_and_wait_arrival(self, goal: PoseStamped) -> bool:
         """Drive to yield goal Y and wait for arrival, streaming the control chain meanwhile.
