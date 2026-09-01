@@ -558,13 +558,17 @@ def main(args=None):
                        help='Robot name used in task_generator topic namespace')
     parser.add_argument('--log-level', type=str, default='info',
                        help='log level for IsaacSim (debug/info/warn/error)')
-    parser.add_argument('--session-tag', type=str, default='',
-                       help='Label prepended to the session directory, e.g. grscenes_1__default')
+    parser.add_argument('--world', type=str, default='',
+                       help='World being loaded, e.g. grscenes_1. Selects the dataset dir: '
+                            'social_gen/traj_data/grscenes/<world>/{data,meta,videos}/')
     parsed_args = parser.parse_args(args)
 
     enable_logging = parsed_args.save_data.lower() == 'true'
     robot_name = parsed_args.robot
-    session_tag = parsed_args.session_tag
+    # NOT named `world`: that is the module-level Isaac World() object (see top of
+    # file). A local `world` here shadows it for the whole function, turning every
+    # world.reset()/step()/play() into a call on this string.
+    world_name = parsed_args.world
     data_logger_replicator_cls = None
     # data_logger_rosbag_cls = None
 
@@ -597,12 +601,20 @@ def main(args=None):
     snapshot_config = _resolve_snapshot_config(robot_name)
 
     def _snapshot_output_root():
-        """Base dir for snapshots/, mirroring the data logger output layout."""
+        """Base dir for snapshots/, mirroring the data logger output layout.
+
+        With --world set this is the same <world> dir the dataset goes to, so
+        snapshots/ ends up beside data/, meta/ and videos/. Without --world we fall
+        back to Arena/collected_data, matching the logger's legacy layout (which
+        puts its own timestamped session dir under there).
+        """
         _p = Path(__file__).resolve()
         while _p.name != 'Arena' and _p.parent != _p:
             _p = _p.parent
-        base = _p / 'collected_data'
-        return str(base / session_tag) if session_tag else str(base)
+        if world_name:
+            # social_gen sits next to Arena/ in the workspace src/ dir -- hence _p.parent.
+            return str(_p.parent / 'social_gen' / 'traj_data' / 'grscenes' / world_name)
+        return str(_p / 'collected_data')
 
 
     if enable_logging:
@@ -819,17 +831,41 @@ def main(args=None):
                                     _p = Path(__file__).resolve()
                                     while _p.name != 'Arena' and _p.parent != _p:
                                         _p = _p.parent
-                                    if session_tag:
-                                        _output_dir = str(_p / 'collected_data' / session_tag)
+                                    # Datasets live in the social_gen package, which sits
+                                    # next to Arena/ in the workspace src/ dir -- hence
+                                    # _p.parent. Layout is
+                                    #   social_gen/traj_data/grscenes/<world>/{data,meta,videos}/
+                                    # With no --world we fall back to Arena/collected_data
+                                    # and the logger's timestamped-session layout.
+                                    if world_name:
+                                        _output_dir = str(
+                                            _p.parent / 'social_gen' / 'traj_data' / 'grscenes')
                                     else:
                                         _output_dir = str(_p / 'collected_data')
+
                                     logger = data_logger_replicator_cls(
                                         camera_prim_path=target_camera_path,
                                         pedestrian_root_path=target_pedestrian_root_path,
                                         lidar_prim_path=target_lidar_path,
                                         output_dir=_output_dir,
+                                        # Passed so the MCAP frame_id/topic match the robot that is
+                                        # actually running. They used to be hardcoded "jackal",
+                                        # which made the recorded frame_id un-alignable with TF for
+                                        # any other model.
+                                        robot_name=robot_name,
+                                        # Dataset capture rate in sim time. Matches
+                                        # process_raw_to_dataset.py's default --fps 30;
+                                        # change both together or preview mp4 playback
+                                        # speed drifts from sim time.
+                                        fps=30,
+                                        # Selects the dataset dir: one world, one dataset.
+                                        world=world_name,
                                     )
-                                    sys.stderr.write(f"\n [Logger] Output dir: {_output_dir}\n")
+                                    if world_name:
+                                        sys.stderr.write(f"\n[Logger] World: {world_name}\n")
+                                        sys.stderr.write(f"[Logger] Output: {_output_dir}/{world_name}/\n")
+                                    else:
+                                        sys.stderr.write(f"\n[Logger] Output dir: {_output_dir}\n")
                                     '''
                                     logger = data_logger_rosbag_cls(
                                         topics=[
