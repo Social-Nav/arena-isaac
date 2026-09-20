@@ -4,8 +4,18 @@
 # preload attrs
 import argparse
 import os
+import sys
 import arena_simulation_setup
 import arena_simulation_setup.utils.cattrs
+
+
+# SimulationApp has to receive its UI mode before it is constructed.  The normal
+# argparse parser lives in main(), which is too late, so parse just this launch
+# argument first and leave all remaining arguments untouched for main().
+_bootstrap_parser = argparse.ArgumentParser(add_help=False)
+_bootstrap_parser.add_argument('--headless', default='false')
+_bootstrap_args, _ = _bootstrap_parser.parse_known_args()
+_isaac_headless = str(_bootstrap_args.headless).strip().lower() in {'1', 'true', 'yes', 'on'}
 
 # Use the isaacsim to import SimulationApp
 from isaacsim import SimulationApp
@@ -14,10 +24,9 @@ from isaacsim import SimulationApp
 CONFIG = {
     #"renderer": "Wireframe",
     "renderer": "RayTracedLighting",
-    "headless": False,
+    "headless": _isaac_headless,
 }
 #import parent directory
-import sys
 from pathlib import Path
 
 simulation_app = SimulationApp(CONFIG)
@@ -561,6 +570,8 @@ def main(args=None):
     parser.add_argument('--world', type=str, default='',
                        help='World being loaded, e.g. grscenes_1. Selects the dataset dir: '
                             'social_gen/traj_data/grscenes/<world>/{data,meta,videos}/')
+    parser.add_argument('--headless', type=str, default='false',
+                       help='Run Isaac Sim without its GUI window (forwarded by arena launch).')
     parsed_args = parser.parse_args(args)
 
     enable_logging = parsed_args.save_data.lower() == 'true'
