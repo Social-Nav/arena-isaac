@@ -73,12 +73,6 @@ def odom(
         # physics body and outputs body-frame velocities. Pose is still sourced from the transform;
         # only the twist comes from here. chassisPrim is fed via OgnGetPrimAtPath (same pattern as
         # the differential-drive graph's targetPrim).
-        compute_odometry = graph.node('compute_odometry', 'isaacsim.core.nodes.IsaacComputeOdometry')
-        get_chassis_prim = graph.node('get_chassis_prim', 'omni.replicator.core.OgnGetPrimAtPath')
-        get_chassis_prim.attribute('paths', [prim_path])
-
-        on_playback_tick.connect('tick', get_chassis_prim, 'execIn')
-        on_playback_tick.connect('tick', compute_odometry, 'execIn')
         on_playback_tick.connect('tick', publish_odom_topic, 'execIn')
         read_simulation_time.connect('simulationTime', publish_odom_topic, 'timeStamp')
         get_chassis_prim.connect('prims', compute_odometry, 'chassisPrim')
