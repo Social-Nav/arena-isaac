@@ -5,6 +5,9 @@ import time
 from omni.isaac.core import World
 from pedestrian.simulator.logic.people.person import Person
 from pedestrian.simulator.logic.people.rendered_state_backend import make_backend_if_enabled
+from pedestrian.simulator.logic.people.character_selector import (
+    CharacterPoolSelector,
+)
 from pedestrian.simulator.logic.people_manager import PeopleManager
 
 from isaac_utils.utils.path import world_path
@@ -20,6 +23,14 @@ try:
     _LOGGER = get_logger('isaac_spawn_ped')
 except Exception:
     _LOGGER = None
+
+
+_CHARACTER_SELECTOR = CharacterPoolSelector()
+if _LOGGER is not None:
+    _LOGGER.info(
+        f"Pedestrian model selector seed: {_CHARACTER_SELECTOR.seed} "
+        f"(override with ARENA_PEDESTRIAN_MODEL_SEED)"
+    )
 
 
 @on_exception(False)
@@ -47,11 +58,29 @@ def spawn_pedestrian(pedestrian: Pedestrian) -> bool:
     # left no artifact and raised no error.
     backend = make_backend_if_enabled()
 
+    requested_model = pedestrian.character_name
+    resolved_model = _CHARACTER_SELECTOR.resolve(
+        pedestrian.name,
+        requested_model,
+    )
+    if _LOGGER is not None:
+        _LOGGER.info(
+            f"Pedestrian model selection: entity={pedestrian.name} "
+            f"requested={requested_model} resolved={resolved_model}"
+        )
+
     if not pedestrian.controller_stats:
-        Person(world, usd_path, pedestrian.character_name, position, orientation, backend=backend)
+        Person(world, usd_path, resolved_model, position, orientation, backend=backend)
     else:
-        Person(world, usd_path, pedestrian.character_name, position, orientation,
-               pedestrian.controller_name, backend=backend)
+        Person(
+            world,
+            usd_path,
+            resolved_model,
+            position,
+            orientation,
+            pedestrian.controller_name,
+            backend=backend,
+        )
 
     if _LOGGER is not None:
         _LOGGER.warn(f"[SpawnPedestrians] spawned {pedestrian.name} in {time.monotonic() - started:.3f}s")
