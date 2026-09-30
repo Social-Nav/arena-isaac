@@ -1,0 +1,379 @@
+schema_version: 1
+
+# Identity inventory for the Isaac 5.1 People assets used by Arena.
+#
+# Counting rules:
+# - Classic original/new/short-name assets with the same appearance count as one identity.
+# - One DH UUID counts as one identity.
+# - A DH base asset and its Extended _1.._10 material variants remain one identity.
+# - biped_demo is a rig/demo asset and is not a character identity.
+#
+# Accessory booleans below only mean that the Persona relationship exists. They
+# do not classify the concrete child prim (for example safety helmet vs cap).
+# safety_helmet therefore remains pending until the child prim scan is reviewed.
+
+summary:
+  classic_identities: 11
+  dh_identities: 21
+  total_identities: 32
+  dh_appearances_per_identity: 11
+
+# Scenario-facing pools. Every identity belongs to exactly one pool.
+pools:
+  pedestrian:
+    appearance_profile: general_pedestrian
+    identities:
+      - classic_female_business_01
+      - dh_02c80685
+      - dh_1344c2cb
+      - dh_3809dbd8
+      - dh_3ca0be41
+      - dh_6421103e
+      - dh_68334871
+      - dh_6c3a2862
+      - dh_70adb872
+      - dh_79dc5092
+      - dh_83673a2c
+      - dh_859b675a
+      - dh_8b14c500
+      - dh_a03a408f
+      - dh_a34770f4
+      - dh_a3a38303
+      - dh_a8777216
+      - dh_c25aaa7e
+      - dh_c638e5d6
+      - dh_ce9ae2ef
+      - dh_d63572fc
+      - dh_f50e69fb
+  doctor:
+    identities:
+      - classic_female_medical_01
+      - classic_male_medical_01
+  police:
+    identities:
+      - classic_female_police_01
+      - classic_female_police_02
+      - classic_female_police_03
+      - classic_male_police_01
+  construction_worker:
+    identities:
+      - classic_male_construction_01
+      - classic_male_construction_02
+      - classic_male_construction_03
+      - classic_male_construction_04
+
+appearance_profiles:
+  general_pedestrian:
+    hide_prim_name_contains:
+      - helmet_safety
+      - vest_highvis
+
+classic_identities:
+  - id: classic_female_business_01
+    gender: female
+    age_group: adult
+    role: business
+    outfit_category: business
+    asset_variants:
+      - Isaac/People/Characters/original_female_adult_business_02/female_adult_business_02.usd
+      - Isaac/People/Characters/F_Business_02/F_Business_02.usd
+
+  - id: classic_female_medical_01
+    gender: female
+    age_group: adult
+    role: medical
+    outfit_category: medical
+    asset_variants:
+      - Isaac/People/Characters/original_female_adult_medical_01/female_adult_medical_01.usd
+      - Isaac/People/Characters/F_Medical_01/F_Medical_01.usd
+
+  - id: classic_male_medical_01
+    gender: male
+    age_group: adult
+    role: medical
+    outfit_category: medical
+    asset_variants:
+      - Isaac/People/Characters/original_male_adult_medical_01/male_adult_medical_01.usd
+      - Isaac/People/Characters/M_Medical_01/M_Medical_01.usd
+
+  - id: classic_female_police_01
+    gender: female
+    age_group: adult
+    role: security
+    outfit_category: police
+    asset_variants:
+      - Isaac/People/Characters/original_female_adult_police_01/female_adult_police_01.usd
+      - Isaac/People/Characters/female_adult_police_01_new/female_adult_police_01_new.usd
+
+  - id: classic_female_police_02
+    gender: female
+    age_group: adult
+    role: security
+    outfit_category: police
+    asset_variants:
+      - Isaac/People/Characters/original_female_adult_police_02/female_adult_police_02.usd
+      - Isaac/People/Characters/female_adult_police_02/female_adult_police_02.usd
+
+  - id: classic_female_police_03
+    gender: female
+    age_group: adult
+    role: security
+    outfit_category: police
+    asset_variants:
+      - Isaac/People/Characters/original_female_adult_police_03/female_adult_police_03.usd
+      - Isaac/People/Characters/female_adult_police_03_new/female_adult_police_03_new.usd
+
+  - id: classic_male_police_01
+    gender: male
+    age_group: adult
+    role: security
+    outfit_category: police
+    asset_variants:
+      - Isaac/People/Characters/original_male_adult_police_04/male_adult_police_04.usd
+      - Isaac/People/Characters/male_adult_police_04/male_adult_police_04.usd
+
+  - id: classic_male_construction_01
+    gender: male
+    age_group: adult
+    role: construction
+    outfit_category: construction
+    asset_variants:
+      - Isaac/People/Characters/original_male_adult_construction_01/male_adult_construction_01.usd
+      - Isaac/People/Characters/male_adult_construction_01_new/male_adult_construction_01_new.usd
+
+  - id: classic_male_construction_02
+    gender: male
+    age_group: adult
+    role: construction
+    outfit_category: construction
+    asset_variants:
+      - Isaac/People/Characters/original_male_adult_construction_02/male_adult_construction_02.usd
+
+  - id: classic_male_construction_03
+    gender: male
+    age_group: adult
+    role: construction
+    outfit_category: construction
+    asset_variants:
+      - Isaac/People/Characters/original_male_adult_construction_03/male_adult_construction_03.usd
+      - Isaac/People/Characters/male_adult_construction_03/male_adult_construction_03.usd
+
+  - id: classic_male_construction_04
+    gender: male
+    age_group: adult
+    role: construction
+    outfit_category: construction
+    asset_variants:
+      - Isaac/People/Characters/original_male_adult_construction_05/male_adult_construction_05.usd
+      - Isaac/People/Characters/male_adult_construction_05_new/male_adult_construction_05_new.usd
+
+dh_identities:
+  - id: dh_02c80685
+    uuid: 02c80685-06e3-11ef-ae8a-f4b30194174e
+    gender: male
+    age: 20
+    age_group: young_adult
+    outfit_category: workwear
+    stature_cm: 175.99
+    accessories: {headwear: false, headphone: true, eyewear: false, mask: true, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_1344c2cb
+    uuid: 1344c2cb-06f9-11ef-8960-f4b30194174e
+    gender: male
+    age: 26
+    age_group: young_adult
+    outfit_category: workwear
+    stature_cm: 182.57
+    accessories: {headwear: true, headphone: false, eyewear: false, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_3809dbd8
+    uuid: 3809dbd8-06f1-11ef-b76b-f4b30194174e
+    gender: female
+    age: 41
+    age_group: adult
+    outfit_category: casual
+    stature_cm: 167.17
+    accessories: {headwear: true, headphone: true, eyewear: true, mask: true, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_3ca0be41
+    uuid: 3ca0be41-0420-11ef-933e-b40ede968205
+    gender: male
+    age: 57
+    age_group: adult
+    outfit_category: workwear
+    stature_cm: 179.55
+    accessories: {headwear: false, headphone: true, eyewear: false, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_6421103e
+    uuid: 6421103e-06b2-11ef-b156-b04f13dd02fd
+    gender: male
+    age: 63
+    age_group: senior
+    outfit_category: workwear
+    stature_cm: 190.78
+    accessories: {headwear: true, headphone: true, eyewear: true, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_68334871
+    uuid: 68334871-06f4-11ef-bf88-f4b30194174e
+    gender: female
+    age: 53
+    age_group: adult
+    outfit_category: workwear
+    stature_cm: 160.26
+    accessories: {headwear: false, headphone: false, eyewear: true, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_6c3a2862
+    uuid: 6c3a2862-07bd-11ef-8ce1-f4b30194174e
+    gender: male
+    age: 43
+    age_group: adult
+    outfit_category: workwear
+    stature_cm: 184.49
+    accessories: {headwear: false, headphone: false, eyewear: false, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_70adb872
+    uuid: 70adb872-0410-11ef-92d5-b40ede968205
+    gender: male
+    age: 57
+    age_group: adult
+    outfit_category: workwear
+    stature_cm: 182.21
+    accessories: {headwear: true, headphone: false, eyewear: false, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_79dc5092
+    uuid: 79dc5092-066b-11ef-86db-f4b30194174e
+    gender: female
+    age: 42
+    age_group: adult
+    outfit_category: workwear
+    stature_cm: 158.60
+    accessories: {headwear: false, headphone: true, eyewear: false, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_83673a2c
+    uuid: 83673a2c-069c-11ef-b339-b04f13dd02fd
+    gender: male
+    age: 47
+    age_group: adult
+    outfit_category: workwear
+    stature_cm: 164.89
+    accessories: {headwear: true, headphone: true, eyewear: true, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_859b675a
+    uuid: 859b675a-06da-11ef-8e40-f4b30194174e
+    gender: male
+    age: 63
+    age_group: senior
+    outfit_category: workwear
+    stature_cm: 180.85
+    accessories: {headwear: true, headphone: false, eyewear: false, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_8b14c500
+    uuid: 8b14c500-07c4-11ef-94b9-f4b30194174e
+    gender: male
+    age: 49
+    age_group: adult
+    outfit_category: workwear
+    stature_cm: 177.60
+    accessories: {headwear: false, headphone: true, eyewear: true, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_a03a408f
+    uuid: a03a408f-06dd-11ef-8e87-f4b30194174e
+    gender: male
+    age: 58
+    age_group: adult
+    outfit_category: workwear
+    stature_cm: 170.67
+    accessories: {headwear: true, headphone: true, eyewear: true, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_a34770f4
+    uuid: a34770f4-06fd-11ef-bbfd-f4b30194174e
+    gender: male
+    age: 59
+    age_group: adult
+    outfit_category: workwear
+    stature_cm: 176.39
+    accessories: {headwear: false, headphone: true, eyewear: true, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_a3a38303
+    uuid: a3a38303-06b5-11ef-b85f-b04f13dd02fd
+    gender: male
+    age: 56
+    age_group: adult
+    outfit_category: workwear
+    stature_cm: 183.31
+    accessories: {headwear: false, headphone: false, eyewear: true, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_a8777216
+    uuid: a8777216-069a-11ef-ab41-b04f13dd02fd
+    gender: female
+    age: 62
+    age_group: senior
+    outfit_category: casual
+    stature_cm: 158.09
+    accessories: {headwear: false, headphone: false, eyewear: true, mask: true, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_c25aaa7e
+    uuid: c25aaa7e-03f2-11ef-9606-b40ede968205
+    gender: male
+    age: 35
+    age_group: young_adult
+    outfit_category: workwear
+    stature_cm: 183.73
+    accessories: {headwear: false, headphone: true, eyewear: true, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_c638e5d6
+    uuid: c638e5d6-0697-11ef-b025-b04f13dd02fd
+    gender: male
+    age: 50
+    age_group: adult
+    outfit_category: casual
+    stature_cm: 186.80
+    accessories: {headwear: true, headphone: true, eyewear: false, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_ce9ae2ef
+    uuid: ce9ae2ef-06ed-11ef-8c2e-f4b30194174e
+    gender: female
+    age: 24
+    age_group: young_adult
+    outfit_category: workwear
+    stature_cm: 165.61
+    accessories: {headwear: true, headphone: false, eyewear: false, mask: false, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_d63572fc
+    uuid: d63572fc-0690-11ef-ad97-b04f13dd02fd
+    gender: male
+    age: 41
+    age_group: adult
+    outfit_category: casual
+    stature_cm: 185.39
+    accessories: {headwear: false, headphone: true, eyewear: true, mask: true, safety_helmet: pending}
+    appearance_variants: 11
+
+  - id: dh_f50e69fb
+    uuid: f50e69fb-067b-11ef-871f-b04f13dd02fd
+    gender: male
+    age: 64
+    age_group: senior
+    outfit_category: casual
+    stature_cm: 179.26
+    accessories: {headwear: false, headphone: true, eyewear: true, mask: false, safety_helmet: pending}
+    appearance_variants: 11

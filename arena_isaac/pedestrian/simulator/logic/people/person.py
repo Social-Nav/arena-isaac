@@ -13,11 +13,15 @@ from isaac_utils.utils.assets import get_assets_root_path_safe
 from omni.anim.people import PeopleSettings
 from isaacsim.core.utils import prims
 from omni.usd import get_stage_next_free_path
-from pxr import Gf, Sdf, UsdGeom
+from pxr import Gf, Sdf, Usd, UsdGeom
 from scipy.spatial.transform import Rotation
 
 from pedestrian.simulator.logic.people.person_controller import PersonController
 from pedestrian.simulator.logic.people_manager import PeopleManager
+from pedestrian.simulator.logic.people.character_assets import (
+    CHARACTER_ASSETS,
+    resolve_character_asset,
+)
 
 # Extension APIs
 from pedestrian.simulator.logic.state import State
@@ -86,10 +90,16 @@ class Person:
         self._character_name = character_name
 
         # Get the USD file corresponding to the character
-        self.char_usd_file = Person.get_path_for_character_prim(character_name)
+        self._canonical_character_name, self._character_asset = (
+            resolve_character_asset(character_name)
+        )
+        self.char_usd_file = Person.get_path_for_character_prim(
+            self._canonical_character_name
+        )
 
         # Spawn the agent in the world
         self.spawn_agent(self.char_usd_file, self._stage_prefix, init_pos, init_yaw)
+        self.apply_appearance_profile()
 
         # Set the controller for the person if any and initialize it
         self._controller = controller
@@ -118,6 +128,28 @@ class Person:
             self._world.add_timeline_callback(cb_path, self.sim_start_stop)
 
         self._character_graph = None
+
+    def apply_appearance_profile(self):
+        """Hide reviewed asset parts without modifying the source USD."""
+        hidden_tokens = self._character_asset.hide_prim_name_contains
+        if not hidden_tokens:
+            return
+
+        hidden_paths = []
+        for prim in Usd.PrimRange(self.prim):
+            prim_name = prim.GetName().lower()
+            if not any(token in prim_name for token in hidden_tokens):
+                continue
+            imageable = UsdGeom.Imageable(prim)
+            if imageable:
+                imageable.MakeInvisible()
+                hidden_paths.append(str(prim.GetPath()))
+
+        if hidden_paths:
+            carb.log_info(
+                f"Applied pedestrian appearance profile to "
+                f"'{self._canonical_character_name}': {hidden_paths}"
+            )
 
     @property
     def character_graph(self):
@@ -367,37 +399,22 @@ class Person:
 
     @staticmethod
     def get_character_asset_list():
-        # List all files in characters directory
-        result, folder_list = omni.client.list("{}/".format(Person.assets_root_path))
-
-        if result != omni.client.Result.OK:
-            carb.log_error("Unable to get character assets from provided asset root path.")
-            return
-
-        # Prune items from folder list that are not directories.
-        pruned_folder_list = [folder.relative_path for folder in folder_list
-                              if (folder.flags & omni.client.ItemFlags.CAN_HAVE_CHILDREN) and not folder.relative_path.startswith(".")]
-
-        return pruned_folder_list
+        return list(CHARACTER_ASSETS)
 
     @staticmethod
     def get_path_for_character_prim(agent_name):
-
-        # Check if a folder with agent_name exists. If exists we load the character, else we load a random character
-        agent_folder = os.path.join(Person.assets_root_path, agent_name)
-        result, properties = omni.client.stat(agent_folder)
-
-        # Attempt to load the character if it exists, otherwise load a random character
+        _, asset = resolve_character_asset(agent_name)
+        # assets_root_path points at the Isaac asset server root.  Registry
+        # paths intentionally include Isaac/People so classic and DH assets
+        # can coexist in one fixed scenario-facing namespace.
+        root = get_assets_root_path_safe().rstrip("/")
+        usd_path = f"{root}/{asset.relative_usd}"
+        result, _ = omni.client.stat(usd_path)
         if result != omni.client.Result.OK:
-            carb.log_error(f"Character folder does not exist: {agent_name}. Available: {Person.get_character_asset_list()}")
-            return None
-
-        # Get the usd present in the character folder
-        character_folder = "{}/{}".format(Person.assets_root_path, agent_name)
-        character_usd = Person.get_usd_in_folder(character_folder)
-
-        # Return the character name (folder name) and the usd path to the character
-        return "{}/{}".format(character_folder, character_usd)
+            raise FileNotFoundError(
+                f"Pedestrian asset '{agent_name}' is unavailable: {usd_path} ({result})"
+            )
+        return usd_path
 
     @staticmethod
     def get_usd_in_folder(character_folder_path):
