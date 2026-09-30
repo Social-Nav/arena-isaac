@@ -359,6 +359,7 @@ def farthest_visible_goal(
     flip_v=False,
     depth_is_euclidean=False,
     robot_xy=None,
+    max_goal_distance=4.0,
 ):
     """Farthest visible pixel goal (footprint projection).
 
@@ -377,6 +378,11 @@ def farthest_visible_goal(
     difference between a few px of error and ~100 px. It is also the wrong target: the
     label should be a spot the robot can drive onto, not a point in mid-air at lens
     height. Required -- passing None falls back to the camera track and warns.
+
+    max_goal_distance: maximum XY distance in world coordinates from the robot at
+    `frame_idx` to a future goal. The search stops at the first frame outside this
+    radius, so the remaining path is deliberately truncated even if it later curves
+    back inside the radius.
     """
     h, w = depth.shape
     T_w2c = np.linalg.inv(extrinsics[frame_idx])
@@ -395,6 +401,8 @@ def farthest_visible_goal(
         # gets closer again), which is why the min_ground_dist test below uses `continue`.
         travelled += float(np.hypot(*(robot_xy[j] - robot_xy[j - 1])))
         if travelled > lookahead:
+            break
+        if float(np.hypot(*(robot_xy[j] - here_xy))) > max_goal_distance:
             break
         # Footprint: the robot's ground position, forced onto the floor plane.
         p_world = np.array([robot_xy[j][0], robot_xy[j][1], ground_z, 1.0])
@@ -553,6 +561,7 @@ def process_episode(ep_dir, ep_id, video_chunk, data_chunk, task_index, cfg, raw
             cfg.flip_v,
             cfg.depth_is_euclidean,
             xyyaw[:, :2],
+            cfg.max_goal_distance,
         )
         if goal is None or rel < 3:
             goals.append([-1, -1])
@@ -1272,6 +1281,13 @@ def main():
              "a frame count means a different distance at every speed and fps, while the "
              "camera's near blind spot is a fixed distance (default 5.0 m)",
     )
+    p.add_argument(
+        "--max-goal-distance",
+        type=float,
+        default=4.0,
+        help="maximum world-frame XY distance from the current robot position to a pixel goal. "
+             "The future path is truncated at the first frame beyond this radius (default 4.0 m)",
+    )
     p.add_argument("--margin", type=float, default=0.2, help="depth occlusion margin (m)")
     p.add_argument(
         "--min-ground-dist",
@@ -1308,6 +1324,9 @@ def main():
     )
     p.add_argument("--workers", type=int, default=1, help="parallel workers (currently unused, TODO)")
     cfg = p.parse_args()
+
+    if cfg.max_goal_distance <= 0:
+        p.error("--max-goal-distance must be greater than 0")
 
     # Resolve the forward threshold to the per-frame distance discretize_actions wants.
     # It compares against a single frame-to-frame step, so a distance given directly is
