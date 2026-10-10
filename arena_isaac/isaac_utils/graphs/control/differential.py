@@ -34,7 +34,7 @@ def differential(
     graph = Graph(graph_path)
 
     # Create nodes
-    on_playback_tick = graph.node('on_playback_tick', 'omni.graph.action.OnPlaybackTick')
+    on_physics_step = graph.node('on_physics_step', 'isaacsim.core.nodes.OnPhysicsStep')
     ros2_subscribe_twist = graph.node('ros2_subscribe_twist', 'isaacsim.ros2.bridge.ROS2SubscribeTwist')
     scale_stage_units = graph.node('scale_stage_units', 'isaacsim.core.nodes.OgnIsaacScaleToFromStageUnit')
     break3vector_linear = graph.node('break3vector_linear', 'omni.graph.nodes.BreakVector3')
@@ -54,7 +54,7 @@ def differential(
     articulation_controller.attribute('robotPath', prim_path)
 
     # Connect nodes
-    on_playback_tick.connect('tick', ros2_subscribe_twist, 'execIn')
+    on_physics_step.connect('step', ros2_subscribe_twist, 'execIn')
     ros2_subscribe_twist.connect('execOut', differential_controller, 'execIn')
     ros2_subscribe_twist.connect('execOut', articulation_controller, 'execIn')
     ros2_subscribe_twist.connect('linearVelocity', scale_stage_units, 'value')

@@ -159,14 +159,10 @@ import std_srvs.srv
 import std_msgs.msg
 import action_msgs.msg
 import builtin_interfaces.msg
-import geometry_msgs.msg
-import nav_msgs.msg
-import rosgraph_msgs.msg
 import sensor_msgs.msg
-import tf2_msgs.msg
 
 # graphs
-from isaac_utils.graphs.time import PublishTime
+from isaac_utils.graphs.time import PublishTime, simulation_time
 from isaac_utils.managers.door_manager import DoorManager
 from isaac_utils.managers.elevator_manager import elevator_manager
 
@@ -414,133 +410,6 @@ class RaycastObstaclePublisher(rclpy.node.Node):
                 _drive_visible_pedestrian(goal)
             except Exception as exc:
                 carb.log_warn(f'[run_isaacsim] failed to drive visible pedestrian {goal.name}: {exc}')
-
-
-class ManualStepStatePublisher:
-    """Publishes core ROS state from the Python step loop.
-
-    Headless eval can advance Isaac through ``world.step()`` without firing
-    OnPlaybackTick-driven OmniGraph ROS publishers.  This publisher keeps the
-    task-generator readiness path tied to the actual Isaac step loop.
-    """
-
-    def __init__(self, node: rclpy.node.Node):
-        self._node = node
-        self._clock_pub = node.create_publisher(rosgraph_msgs.msg.Clock, '/clock', 10)
-        self._tf_pub = node.create_publisher(tf2_msgs.msg.TFMessage, '/tf', 10)
-        self._odom_pubs: dict[str, object] = {}
-        self._last_pose: dict[str, tuple[float, isaac_geom.Translation, isaac_geom.Rotation]] = {}
-        self._last_robot_paths: set[str] = set()
-
-    @staticmethod
-    def _stamp(sim_time: float):
-        stamp = builtin_interfaces.msg.Time()
-        stamp.sec = int(sim_time)
-        stamp.nanosec = int((sim_time - stamp.sec) * 1_000_000_000)
-        return stamp
-
-    @staticmethod
-    def _namespace_from_robot_path(robot_path: str) -> str:
-        name = robot_path.rstrip('/').split('/')[-1]
-        return f'task_generator_node/{name}' if name else ''
-
-    @staticmethod
-    def _odom_topic(namespace: str) -> str:
-        return f'/{namespace}/odom' if namespace else '/odom'
-
-    @staticmethod
-    def _frames(namespace: str) -> tuple[str, str, str]:
-        robot_name = namespace.rstrip('/').split('/')[-1] if namespace else ''
-        if robot_name:
-            return f'{robot_name}/world', f'{robot_name}/odom', f'{robot_name}/base_link'
-        return 'world', 'odom', 'base_link'
-
-    def _publisher_for(self, topic: str):
-        pub = self._odom_pubs.get(topic)
-        if pub is None:
-            pub = self._node.create_publisher(nav_msgs.msg.Odometry, topic, 10)
-            self._odom_pubs[topic] = pub
-            carb.log_warn(f'[run_isaacsim] Manual odom publisher active on {topic}')
-        return pub
-
-    def publish(self, sim_time: float) -> None:
-        stamp = self._stamp(max(sim_time, 0.0))
-
-        clock_msg = rosgraph_msgs.msg.Clock()
-        clock_msg.clock = stamp
-        self._clock_pub.publish(clock_msg)
-
-        current_robot_paths = set(isaac_geom.registered_robots().keys())
-        new_robot_paths = current_robot_paths - self._last_robot_paths
-        for robot_path in sorted(new_robot_paths):
-            carb.log_warn(
-                f'[run_isaacsim] Manual step state publisher tracking {robot_path} '
-                f'-> {isaac_geom.registered_robots().get(robot_path)}'
-            )
-        self._last_robot_paths = current_robot_paths
-
-        for robot_path in sorted(current_robot_paths):
-            namespace = self._namespace_from_robot_path(robot_path)
-            world_frame, odom_frame, base_frame = self._frames(namespace)
-            odom_topic = self._odom_topic(namespace)
-            pose = isaac_geom.get_world_pose(robot_path)
-            if pose is None:
-                continue
-            translation, rotation = pose
-            last = self._last_pose.get(robot_path)
-
-            vx = vy = vz = wx = wy = wz = 0.0
-            if last is not None:
-                last_time, last_translation, last_rotation = last
-                dt = sim_time - last_time
-                if dt > 1e-9:
-                    vx = (translation.x - last_translation.x) / dt
-                    vy = (translation.y - last_translation.y) / dt
-                    vz = (translation.z - last_translation.z) / dt
-                    prev_yaw = last_rotation.euler('z')[0]
-                    yaw = rotation.euler('z')[0]
-                    dyaw = (yaw - prev_yaw + _math.pi) % (2.0 * _math.pi) - _math.pi
-                    wz = dyaw / dt
-
-            self._last_pose[robot_path] = (sim_time, translation, rotation)
-
-            odom_msg = nav_msgs.msg.Odometry()
-            odom_msg.header.stamp = stamp
-            odom_msg.header.frame_id = odom_frame
-            odom_msg.child_frame_id = base_frame
-            odom_msg.pose.pose.position.x = translation.x
-            odom_msg.pose.pose.position.y = translation.y
-            odom_msg.pose.pose.position.z = translation.z
-            odom_msg.pose.pose.orientation.w = rotation.w
-            odom_msg.pose.pose.orientation.x = rotation.x
-            odom_msg.pose.pose.orientation.y = rotation.y
-            odom_msg.pose.pose.orientation.z = rotation.z
-            odom_msg.twist.twist.linear.x = vx
-            odom_msg.twist.twist.linear.y = vy
-            odom_msg.twist.twist.linear.z = vz
-            odom_msg.twist.twist.angular.x = wx
-            odom_msg.twist.twist.angular.y = wy
-            odom_msg.twist.twist.angular.z = wz
-            self._publisher_for(odom_topic).publish(odom_msg)
-
-            map_tf = geometry_msgs.msg.TransformStamped()
-            map_tf.header.stamp = stamp
-            map_tf.header.frame_id = world_frame
-            map_tf.child_frame_id = odom_frame
-            map_tf.transform.rotation.w = 1.0
-
-            odom_tf = geometry_msgs.msg.TransformStamped()
-            odom_tf.header.stamp = stamp
-            odom_tf.header.frame_id = odom_frame
-            odom_tf.child_frame_id = base_frame
-            odom_tf.transform.translation.x = translation.x
-            odom_tf.transform.translation.y = translation.y
-            odom_tf.transform.translation.z = translation.z
-            odom_tf.transform.rotation.w = rotation.w
-            odom_tf.transform.rotation.x = rotation.x
-            odom_tf.transform.rotation.y = rotation.y
-            odom_tf.transform.rotation.z = rotation.z
-            self._tf_pub.publish(tf2_msgs.msg.TFMessage(transforms=[map_tf, odom_tf]))
 
 
 class ManualReplicatorCameraPublisher:
@@ -1092,7 +961,6 @@ def main(args=None):
     IsaacController.wait_for_bridge()
     rclpy.init()
     controller = IsaacController()
-    manual_step_state_pub = ManualStepStatePublisher(controller)
     manual_camera_pub = ManualReplicatorCameraPublisher(controller)
 
     # Subscribe to task lifecycle events to control when data collection happens
@@ -1421,13 +1289,7 @@ def main(args=None):
                     world.step(render=should_render)
                 raycast_pub.drive_visible_pedestrians()
                 _follow_vln_top_down_cameras()
-                try:
-                    sim_time = float(SimulationContext.instance().current_time)
-                except Exception:
-                    sim_time = sim_step_counter * float(
-                        os.environ.get('ARENA_ISAAC_MANUAL_CLOCK_DT_SEC', '0.0166666667')
-                    )
-                manual_step_state_pub.publish(sim_time)
+                sim_time = simulation_time()
                 if should_render:
                     manual_camera_pub.publish(sim_time)
                 step_elapsed = time.monotonic() - step_started

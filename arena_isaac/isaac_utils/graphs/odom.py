@@ -31,7 +31,7 @@ def odom(
 
     graph = Graph(graph_path)
 
-    on_playback_tick = graph.node('on_playback_tick', 'omni.graph.action.OnPlaybackTick')
+    on_physics_step = graph.node('on_physics_step', 'isaacsim.core.nodes.OnPhysicsStep')
     read_simulation_time = graph.node('read_simulation_time', 'isaacsim.core.nodes.IsaacReadSimulationTime')
     get_chassis_prim = graph.node('get_chassis_prim', 'omni.replicator.core.OgnGetPrimAtPath')
     compute_odometry = graph.node('compute_odometry', 'isaacsim.core.nodes.IsaacComputeOdometry')
@@ -41,16 +41,16 @@ def odom(
     publish_map = graph.node('publish_odom_static', 'isaacsim.ros2.bridge.ROS2PublishRawTransformTree')
     publish_odom = graph.node('publish_odom', 'isaacsim.ros2.bridge.ROS2PublishRawTransformTree')
 
-    on_playback_tick.connect('tick', publish_odom, 'execIn')
-    on_playback_tick.connect('tick', publish_map, 'execIn')
-    on_playback_tick.connect('tick', get_chassis_prim, 'execIn')
-    on_playback_tick.connect('tick', compute_odometry, 'execIn')
+    on_physics_step.connect('step', get_chassis_prim, 'execIn')
+    on_physics_step.connect('step', compute_odometry, 'execIn')
+    compute_odometry.connect('execOut', publish_odom, 'execIn')
+    compute_odometry.connect('execOut', publish_map, 'execIn')
+    read_simulation_time.attribute('resetOnStop', False)
     read_simulation_time.connect('simulationTime', publish_odom, 'timeStamp')
     read_simulation_time.connect('simulationTime', publish_map, 'timeStamp')
 
     get_chassis_prim.attribute('paths', [prim_path])
     get_chassis_prim.connect('prims', compute_odometry, 'chassisPrim')
-
     get_transform.attribute('primPath', prim_path)
     get_transform.connect('localToWorldTransform', extract_translation, 'matrix')
     get_transform.connect('localToWorldTransform', extract_rotation, 'matrix')
@@ -67,13 +67,11 @@ def odom(
 
     if odom_topic:
         publish_odom_topic = graph.node('publish_odom_topic', 'isaacsim.ros2.bridge.ROS2PublishOdometry')
-        # ROS2PublishOdometry needs linear/angular velocity. The GetPrimLocalToWorldTransform
-        # path above only yields pose, so odom.twist was always 0 -> the nav2 controller had no
-        # velocity feedback (jittery/unstable cmd_vel). IsaacComputeOdometry reads the chassis
-        # physics body and outputs body-frame velocities. Pose is still sourced from the transform;
-        # only the twist comes from here. chassisPrim is fed via OgnGetPrimAtPath (same pattern as
-        # the differential-drive graph's targetPrim).
-        on_playback_tick.connect('tick', publish_odom_topic, 'execIn')
+        # ComputeOdometry's pose is relative to the initial chassis pose. Arena's
+        # odom frame shares the world origin. GetMatrix4Quaternion orthonormalizes
+        # the body's world matrix before extracting its rotation (essential for
+        # scaled robots); ComputeOdometry supplies only body-frame twist.
+        compute_odometry.connect('execOut', publish_odom_topic, 'execIn')
         read_simulation_time.connect('simulationTime', publish_odom_topic, 'timeStamp')
         get_chassis_prim.connect('prims', compute_odometry, 'chassisPrim')
 

@@ -161,6 +161,13 @@ class USDSceneLoader:
 
             # Add USD reference (content inherits parent xformOp scale)
             scene_prim.GetReferences().AddReference(str(usd_file_path))
+            from isaacsim.core.api.simulation_context import SimulationContext
+            from isaac_utils.utils.physics_scene import consolidate_physics_scenes
+            physics = SimulationContext.instance().get_physics_context()
+            physics_report = consolidate_physics_scenes(
+                omni.usd.get_context().get_stage(), scene_prim_path, physics.prim_path,
+            )
+            carb.log_warn(f'[USDSceneLoader] Single physics scene verified: {physics_report}')
             carb.log_info(
                 f"[USDSceneLoader] Scene referenced with scale={effective_scale:.4f}, "
                 f"pos={list(_pos)}"

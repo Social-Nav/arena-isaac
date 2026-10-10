@@ -316,73 +316,32 @@ ODOM_PUBLISHER_TYPES = {
 
 
 def _disable_odom_graph_tf(prim_path: str) -> int:
-    """Disable TF and odom publishers from USD-embedded OmniGraph nodes.
+    """Disconnect embedded state publishers before their first execution.
 
-    The arena framework creates its own odom OmniGraph via odom.py which
-    publishes the same TF frames (world→odom, odom→base_footprint).
-    If the USD also contains an ROS_Odometry graph with TF publisher nodes,
-    both will publish conflicting transforms for the same frames, causing
-    TF flickering and laser scan distortion.
-
-    This function disables all ROS2PublishRawTransformTree and
-    ROS2PublishOdometry nodes found under prim_path by setting their
-    topicName to a dead topic.
+    An inactive USD node can still execute in the composed OmniGraph runtime.
+    Removing execIn connections authors deletion opinions over the reference,
+    preventing ROS endpoint creation without publishing to dummy topics.
     """
     stage = omni.usd.get_context().get_stage()
-    root_prim = stage.GetPrimAtPath(prim_path)
-    if not root_prim or not root_prim.IsValid():
+    root = stage.GetPrimAtPath(prim_path)
+    if not root or not root.IsValid():
         return 0
-
-    disabled = 0
-    target_types = TF_PUBLISHER_TYPES | ODOM_PUBLISHER_TYPES
-    for prim in Usd.PrimRange(root_prim):
-        if 'OmniGraph' not in prim.GetTypeName():
-            continue
-
-        node_type_attr = prim.GetAttribute('node:type')
-        if not node_type_attr or not node_type_attr.IsValid():
-            continue
-        node_type = str(node_type_attr.Get() or '')
-        if node_type not in target_types:
-            continue
-
-        # Disable by renaming topicName to a dead topic
-        topic_attr = prim.GetAttribute('inputs:topicName')
-        if topic_attr and topic_attr.IsValid():
-            old_val = topic_attr.Get()
-            if old_val and not str(old_val).endswith('__disabled'):
-                topic_attr.Set(f"{old_val}__disabled")
-                carb.log_warn(
-                    f"[SpawnUsdRobot] Disabled {node_type.split('.')[-1]} "
-                    f"topic '{old_val}' on {prim.GetPath()}"
-                )
-                disabled += 1
-                continue
-
-        # For TF publishers that publish to /tf by default (no topicName attr),
-        # create and set a dead topicName
-        try:
-            if not topic_attr or not topic_attr.IsValid():
-                prim.CreateAttribute('inputs:topicName', Sdf.ValueTypeNames.String).Set('/tf__disabled')
-            else:
-                topic_attr.Set('/tf__disabled')
-            carb.log_warn(
-                f"[SpawnUsdRobot] Disabled {node_type.split('.')[-1]} "
-                f"(no topicName) on {prim.GetPath()}"
-            )
-            disabled += 1
-        except Exception as e:
-            carb.log_warn(
-                f"[SpawnUsdRobot] Failed to disable {node_type.split('.')[-1]} "
-                f"on {prim.GetPath()}: {e}"
-            )
-
-    if disabled:
-        carb.log_warn(
-            f"[SpawnUsdRobot] Disabled {disabled} USD-embedded TF/odom "
-            f"publisher(s) under {prim_path}"
-        )
-    return disabled
+    target_types = TF_PUBLISHER_TYPES | ODOM_PUBLISHER_TYPES | {
+        'isaacsim.ros2.bridge.ROS2PublishClock', 'omni.isaac.ros2_bridge.ROS2PublishClock',
+    }
+    targets = [p for p in Usd.PrimRange(root)
+               if str(p.GetAttribute('node:type').Get() or '') in target_types
+               and '/odom_publisher/' not in str(p.GetPath())]
+    with Usd.EditContext(stage, stage.GetSessionLayer()):
+        for prim in targets:
+            execution = prim.GetAttribute('inputs:execIn')
+            if execution:
+                for source in list(execution.GetConnections()):
+                    execution.RemoveConnection(source)
+                if execution.GetConnections():
+                    raise RuntimeError(f'Embedded state publisher remains driven: {prim.GetPath()}')
+            carb.log_warn(f'[SpawnUsdRobot] Disconnected embedded state publisher {prim.GetPath()}')
+    return len(targets)
 
 
 def _get_og_attr_value(prim_path_str: str, attr_name: str):
@@ -1058,6 +1017,8 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
         usd_path=usd_path,
     )
     carb.log_warn(f"[SpawnUsdRobot] USD loaded at {prim_path}")
+    # Must happen before any app update / extension warmup initializes ROS nodes.
+    _disable_odom_graph_tf(prim_path)
 
     usd_name = os.path.splitext(os.path.basename(usd_path))[0]
     is_ai2_bot2 = raw_name.endswith('Ai2_Bot2') or usd_name == 'Ai2_Bot2' or 'Ai2_Bot2' in usd_path

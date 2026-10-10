@@ -83,8 +83,12 @@ class Graph:
         self._actions.append(action)
 
     def execute_unsafe(self, controller: og.Controller) -> bool:
+        graph_config = {"graph_path": self.path, "evaluator_name": "execution"}
+        if any(node.type == 'isaacsim.core.nodes.OnPhysicsStep' for node in self._nodes):
+            # Native physics events evaluate on demand, including render=False.
+            graph_config['pipeline_stage'] = og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_ONDEMAND
         controller.edit(
-            {"graph_path": self.path, "evaluator_name": "execution"},
+            graph_config,
             {
                 og.Controller.Keys.CREATE_NODES: [(node.name, node.type) for node in self._nodes],
             }

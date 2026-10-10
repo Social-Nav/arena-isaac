@@ -1,4 +1,5 @@
 import os
+import math
 
 import carb
 from geometry_msgs.msg import Pose
@@ -34,15 +35,13 @@ def _rescale_differential_controllers(prim_path: str, scale: float) -> int:
     A pure-rotation command (v=0, wz=0.5) checks that: measured/commanded wz ~1.0 if they
     do, ~scale if they do not -- in which case the radius alone was the right fix.
     """
-    if scale == 1.0:
-        return 0
-
     stage = omni.usd.get_context().get_stage()
     root_prim = stage.GetPrimAtPath(prim_path)
     if not root_prim or not root_prim.IsValid():
         return 0
 
     updated = 0
+    failures = []
     for prim in Usd.PrimRange(root_prim):
         if 'OmniGraph' not in prim.GetTypeName():
             continue
@@ -67,14 +66,25 @@ def _rescale_differential_controllers(prim_path: str, scale: float) -> int:
             if og_attr is not None and og_attr.is_valid() and old is None:
                 old = og_attr.get()
             if old is None:
+                failures.append(f'{prim_path_str}.{attr_name}: missing wheel dimension')
                 continue
-            new = float(old) * scale
+            # EditPrims specifies an absolute root scale. Preserve the authored
+            # wheel dimensions so retries and scale=1 restore are idempotent.
+            original_name = 'arena:unscaled:' + attr_name.split(':')[-1]
+            original_attr = prim.GetAttribute(original_name)
+            original = original_attr.Get() if original_attr else None
+            if original is None:
+                original = float(old)
+                prim.CreateAttribute(original_name, Sdf.ValueTypeNames.Double).Set(original)
+            new = float(original) * scale
 
             try:
                 if attr and attr.IsValid():
                     attr.Set(new)
                 if og_attr is not None and og_attr.is_valid():
                     og_attr.set(new)
+                    if not math.isclose(float(og_attr.get()), new, rel_tol=1e-6):
+                        raise RuntimeError('live wheel dimension did not accept scaling')
                 else:
                     carb.log_warn(
                         f"[EditPrims] {attr_name}: no live OmniGraph attribute on "
@@ -86,10 +96,13 @@ def _rescale_differential_controllers(prim_path: str, scale: float) -> int:
                 )
                 updated += 1
             except Exception as e:
+                failures.append(f'{prim_path_str}.{attr_name}: {e}')
                 carb.log_warn(
                     f"[EditPrims] Failed to rescale {attr_name} on {prim_path_str}: {e}"
                 )
 
+    if failures:
+        raise RuntimeError('Wheel scaling failed: ' + '; '.join(failures))
     if not updated:
         carb.log_warn(
             f"[EditPrims] No DifferentialController found under {prim_path}; if this robot "
