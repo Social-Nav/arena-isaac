@@ -76,6 +76,11 @@ from isaac_utils.camera_dynamic_tf import (
     simulation_time_to_sec_nanosec,
     stage_camera_optical_pose,
 )
+from isaac_utils.odom_ownership import (
+    add_odom_owner_cleanup,
+    freeze_odom_backend,
+    get_odom_ownership_specs,
+)
 
 EXTENSIONS_PEOPLE = [
     'omni.anim.people', 
@@ -439,7 +444,6 @@ class ManualStepStatePublisher:
         self._tf_pub = node.create_publisher(tf2_msgs.msg.TFMessage, '/tf', 10)
         self._odom_pubs: dict[str, object] = {}
         self._last_pose: dict[str, tuple[float, isaac_geom.Translation, isaac_geom.Rotation]] = {}
-        self._last_robot_paths: set[str] = set()
 
     @staticmethod
     def _stamp(sim_time: float):
@@ -447,28 +451,26 @@ class ManualStepStatePublisher:
         stamp.sec, stamp.nanosec = simulation_time_to_sec_nanosec(sim_time)
         return stamp
 
-    @staticmethod
-    def _namespace_from_robot_path(robot_path: str) -> str:
-        name = robot_path.rstrip('/').split('/')[-1]
-        return f'task_generator_node/{name}' if name else ''
-
-    @staticmethod
-    def _odom_topic(namespace: str) -> str:
-        return f'/{namespace}/odom' if namespace else '/odom'
-
-    @staticmethod
-    def _frames(namespace: str) -> tuple[str, str, str]:
-        robot_name = namespace.rstrip('/').split('/')[-1] if namespace else ''
-        if robot_name:
-            return f'{robot_name}/world', f'{robot_name}/odom', f'{robot_name}/base_link'
-        return 'world', 'odom', 'base_link'
-
-    def _publisher_for(self, topic: str):
-        pub = self._odom_pubs.get(topic)
+    def _publisher_for(self, spec: dict):
+        topic = spec['topic']
+        owner_token = spec['owner_token']
+        pub = self._odom_pubs.get(owner_token)
         if pub is None:
             pub = self._node.create_publisher(nav_msgs.msg.Odometry, topic, 10)
-            self._odom_pubs[topic] = pub
-            carb.log_warn(f'[run_isaacsim] Manual odom publisher active on {topic}')
+            self._odom_pubs[owner_token] = pub
+
+            def cleanup():
+                owned = self._odom_pubs.pop(owner_token, None)
+                self._last_pose.pop(owner_token, None)
+                if owned is not None:
+                    self._node.destroy_publisher(owned)
+
+            add_odom_owner_cleanup(owner_token, cleanup)
+            carb.log_warn(
+                f'[run_isaacsim] Manual odom owner active topic={topic} '
+                f"frames=({spec['odom_frame']},{spec['base_frame']}) "
+                f"source={spec['source_prim_path']} owner={owner_token}"
+            )
         return pub
 
     def publish(self, sim_time: float) -> None:
@@ -478,24 +480,20 @@ class ManualStepStatePublisher:
         clock_msg.clock = stamp
         self._clock_pub.publish(clock_msg)
 
-        current_robot_paths = set(isaac_geom.registered_robots().keys())
-        new_robot_paths = current_robot_paths - self._last_robot_paths
-        for robot_path in sorted(new_robot_paths):
-            carb.log_warn(
-                f'[run_isaacsim] Manual step state publisher tracking {robot_path} '
-                f'-> {isaac_geom.registered_robots().get(robot_path)}'
-            )
-        self._last_robot_paths = current_robot_paths
-
-        for robot_path in sorted(current_robot_paths):
-            namespace = self._namespace_from_robot_path(robot_path)
-            world_frame, odom_frame, base_frame = self._frames(namespace)
-            odom_topic = self._odom_topic(namespace)
+        # Graph-owned records are intentionally invisible here.  This is the
+        # mutual-exclusion boundary: the step loop can never publish a second
+        # Odometry message or TF for an isaac_graph-owned topic.
+        for spec in get_odom_ownership_specs(backend='manual_step'):
+            robot_path = spec['robot_prim_path']
+            owner_token = spec['owner_token']
+            world_frame = spec['world_frame']
+            odom_frame = spec['odom_frame']
+            base_frame = spec['base_frame']
             pose = isaac_geom.get_world_pose(robot_path)
             if pose is None:
                 continue
             translation, rotation = pose
-            last = self._last_pose.get(robot_path)
+            last = self._last_pose.get(owner_token)
 
             vx = vy = vz = wx = wy = wz = 0.0
             if last is not None:
@@ -510,7 +508,7 @@ class ManualStepStatePublisher:
                     dyaw = (yaw - prev_yaw + _math.pi) % (2.0 * _math.pi) - _math.pi
                     wz = dyaw / dt
 
-            self._last_pose[robot_path] = (sim_time, translation, rotation)
+            self._last_pose[owner_token] = (sim_time, translation, rotation)
 
             odom_msg = nav_msgs.msg.Odometry()
             odom_msg.header.stamp = stamp
@@ -529,7 +527,7 @@ class ManualStepStatePublisher:
             odom_msg.twist.twist.angular.x = wx
             odom_msg.twist.twist.angular.y = wy
             odom_msg.twist.twist.angular.z = wz
-            self._publisher_for(odom_topic).publish(odom_msg)
+            self._publisher_for(spec).publish(odom_msg)
 
             map_tf = geometry_msgs.msg.TransformStamped()
             map_tf.header.stamp = stamp
@@ -1284,6 +1282,11 @@ def main(args=None):
     IsaacController.wait_for_bridge()
     rclpy.init()
     controller = IsaacController()
+    odom_backend_contract = freeze_odom_backend()
+    carb.log_warn(
+        '[run_isaacsim] Odom backend frozen before robot spawn: '
+        + json.dumps(odom_backend_contract, sort_keys=True)
+    )
     manual_step_state_pub = ManualStepStatePublisher(controller)
     camera_backend_session = freeze_camera_backend()
     camera_backend = camera_backend_session.backend

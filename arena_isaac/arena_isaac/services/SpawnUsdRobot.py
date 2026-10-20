@@ -13,6 +13,13 @@ from isaac_utils.camera_runtime_registry import (
     camera_owner_token,
 )
 from isaac_utils.managers.door_manager import DoorManager
+from isaac_utils.odom_ownership import (
+    isaac_graph_enabled,
+    odom_owner_token,
+    odom_publish_backend,
+    register_odom_owner,
+    unregister_odom_robot as unregister_odom_owner_registry,
+)
 
 def _safe_import(module_name, obj_name=None):
     try:
@@ -477,6 +484,29 @@ def _disable_odom_graph_tf(prim_path: str) -> int:
             f"publisher(s) under {prim_path}"
         )
     return disabled
+
+
+def unregister_odom_robot(
+    robot_prim_path: str, *, fail_on_error: bool = True
+) -> dict:
+    """Stop exact graph/manual odom ownership before robot reuse or removal."""
+
+    # This catches an embedded graph, a prior Arena-created graph, and a stale
+    # graph left by a process version that predates the ownership registry.
+    # The manual publisher's exact DDS handle is destroyed by its registry
+    # cleanup callback.  No broad topic or process cleanup is used.
+    disabled_graph_publishers = _disable_odom_graph_tf(robot_prim_path)
+    graph_odom_residual = _has_odom_publisher(robot_prim_path, '')
+    if graph_odom_residual and fail_on_error:
+        raise RuntimeError(
+            f'odom graph publisher remains active for {robot_prim_path} after exact disable'
+        )
+    result = unregister_odom_owner_registry(
+        robot_prim_path, fail_on_error=fail_on_error
+    )
+    result["graph_publishers_disabled"] = disabled_graph_publishers
+    result["graph_odom_residual"] = graph_odom_residual
+    return result
 
 
 def _get_og_attr_value(prim_path_str: str, attr_name: str):
@@ -1232,6 +1262,7 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
     # writers and remove only this robot's image/TF records before the prim can
     # be reused. Cleanup failure aborts the spawn and retains failed handles.
     unregister_vln_camera_robot(prim_path, fail_on_error=True)
+    unregister_odom_robot(prim_path, fail_on_error=True)
 
     create_prim_safe(
         prim_path=prim_path,
@@ -1355,13 +1386,11 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
 
         _disable_odom_graph_tf(prim_path)
 
-        # Strict eval mode must wait for real Isaac odom/TF; do not rely on
-        # synthetic fallback publishers.  Allow opting out only for targeted
-        # graph-debug runs.
-        enable_isaac_odom_graph = str(
-            os.environ.get('ARENA_SPAWN_USD_ROBOT_ENABLE_ISAAC_ODOM_GRAPH', '1')
-        ).strip().lower() not in {'0', 'false', 'no', 'off'}
-        if enable_isaac_odom_graph:
+        # Odom ownership is frozen process-wide before any robot is spawned.
+        # The Python step backend and Isaac graph are mutually exclusive; a
+        # frame rename is never used to conceal two publishers on one topic.
+        odom_backend = odom_publish_backend()
+        if isaac_graph_enabled(odom_backend):
             if not odom.odom(
                 os.path.join(prim_path, 'odom_publisher'),
                 prim_path=odom_prim_path,
@@ -1375,13 +1404,26 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
                 return ''
         else:
             carb.log_warn(
-                '[SpawnUsdRobot] Skipping Isaac USD odom graph because '
-                f'ARENA_SPAWN_USD_ROBOT_ENABLE_ISAAC_ODOM_GRAPH disabled it for {odom_topic}'
+                '[SpawnUsdRobot] Isaac odom graph disabled by exclusive '
+                f'odom backend={odom_backend} for {odom_topic}'
             )
+
+        register_odom_owner(
+            owner_token=odom_owner_token(prim_path, namespace),
+            robot_prim_path=prim_path,
+            namespace=namespace,
+            topic=odom_topic,
+            world_frame=fq_world_frame,
+            odom_frame=fq_odom_frame,
+            base_frame=fq_base_frame,
+            source_prim_path=odom_prim_path,
+            backend=odom_backend,
+        )
 
     except Exception as e:
         carb.log_error(f"[SpawnUsdRobot] Graph setup failed: {e}\n{traceback.format_exc()}")
         unregister_vln_camera_robot(prim_path, fail_on_error=False)
+        unregister_odom_robot(prim_path, fail_on_error=False)
         return ''
 
     geom.register_robot(
@@ -1414,4 +1456,8 @@ spawn_usd_robot_service = Service(
     callback=spawn_usd_robot_callback,
 )
 
-__all__ = ['spawn_usd_robot_service', 'unregister_vln_camera_robot']
+__all__ = [
+    'spawn_usd_robot_service',
+    'unregister_vln_camera_robot',
+    'unregister_odom_robot',
+]
