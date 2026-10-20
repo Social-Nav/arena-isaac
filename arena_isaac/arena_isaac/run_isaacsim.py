@@ -36,6 +36,7 @@ parent_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(parent_dir))
 
 # stdlib
+import json
 import queue
 import random
 import time
@@ -67,6 +68,14 @@ except ImportError:
     from omni.isaac.core import SimulationContext
 
 from isaac_utils.utils import geom as isaac_geom
+from isaac_utils.camera_publish_backend import (
+    freeze_camera_backend,
+    manual_publishers_enabled,
+)
+from isaac_utils.camera_dynamic_tf import (
+    simulation_time_to_sec_nanosec,
+    stage_camera_optical_pose,
+)
 
 EXTENSIONS_PEOPLE = [
     'omni.anim.people', 
@@ -435,8 +444,7 @@ class ManualStepStatePublisher:
     @staticmethod
     def _stamp(sim_time: float):
         stamp = builtin_interfaces.msg.Time()
-        stamp.sec = int(sim_time)
-        stamp.nanosec = int((sim_time - stamp.sec) * 1_000_000_000)
+        stamp.sec, stamp.nanosec = simulation_time_to_sec_nanosec(sim_time)
         return stamp
 
     @staticmethod
@@ -543,12 +551,79 @@ class ManualStepStatePublisher:
             self._tf_pub.publish(tf2_msgs.msg.TFMessage(transforms=[map_tf, odom_tf]))
 
 
-class ManualReplicatorCameraPublisher:
-    """Publishes real Isaac camera annotator frames through rclpy."""
+class DynamicCameraTfPublisher:
+    """Publish live USD base-to-camera optical TF independently of images."""
 
     def __init__(self, node: rclpy.node.Node):
+        self._publisher = node.create_publisher(tf2_msgs.msg.TFMessage, '/tf', 10)
+        self._announced: set[str] = set()
+
+    @staticmethod
+    def _stamp(sim_time: float):
+        stamp = builtin_interfaces.msg.Time()
+        stamp.sec, stamp.nanosec = simulation_time_to_sec_nanosec(sim_time)
+        return stamp
+
+    def publish(self, sim_time: float) -> int:
+        from arena_isaac.services.SpawnUsdRobot import get_vln_camera_tf_specs
+
+        stage = omni.usd.get_context().get_stage()
+        stamp = self._stamp(max(sim_time, 0.0))
+        transforms = []
+        for spec in get_vln_camera_tf_specs():
+            base_path = str(spec.get('base_prim_path') or '')
+            camera_path = str(spec.get('camera_prim_path') or '')
+            parent_frame = str(spec.get('parent_frame') or '')
+            child_frame = str(spec.get('frame') or '')
+            if not stage or not all((base_path, camera_path, parent_frame, child_frame)):
+                raise RuntimeError(
+                    'dynamic camera TF requires stage/base/camera/frame provenance'
+                )
+            pose = stage_camera_optical_pose(stage, base_path, camera_path)
+            transform = geometry_msgs.msg.TransformStamped()
+            transform.header.stamp = stamp
+            transform.header.frame_id = parent_frame
+            transform.child_frame_id = child_frame
+            transform.transform.translation.x = pose['translation'][0]
+            transform.transform.translation.y = pose['translation'][1]
+            transform.transform.translation.z = pose['translation'][2]
+            transform.transform.rotation.x = pose['rotation_xyzw'][0]
+            transform.transform.rotation.y = pose['rotation_xyzw'][1]
+            transform.transform.rotation.z = pose['rotation_xyzw'][2]
+            transform.transform.rotation.w = pose['rotation_xyzw'][3]
+            transforms.append(transform)
+            if child_frame not in self._announced:
+                carb.log_warn(
+                    f'[run_isaacsim] Dynamic camera TF active base_prim={base_path} '
+                    f'camera_prim={camera_path} parent={parent_frame} child={child_frame} '
+                    'producer=DynamicCameraTfPublisher'
+                )
+                self._announced.add(child_frame)
+        if transforms:
+            self._publisher.publish(tf2_msgs.msg.TFMessage(transforms=transforms))
+        return len(transforms)
+
+
+class ManualReplicatorCameraPublisher:
+    """DEPRECATED: isolated diagnostic/legacy image publisher only.
+
+    Qualified evaluation defaults to the native Replicator ROS writer.  This
+    class must never publish the same topics beside native writers and is not an
+    in-episode automatic fallback.  Dynamic camera TF is produced separately
+    and is not deprecated with this image path.
+    """
+
+    def __init__(self, node: rclpy.node.Node):
+        # DEPRECATED path: construction only occurs after an explicit manual
+        # backend selection.  Warn once here, never from the per-frame loop.
+        carb.log_warn(
+            '[run_isaacsim] DEPRECATED manual camera image backend initialized; '
+            'use native Replicator ROS writers for evaluation.  Manual is '
+            'isolated diagnostic/legacy only and will not auto-switch.'
+        )
         self._node = node
         self._cameras: dict[str, dict] = {}
+        self._backend = camera_publish_backend()
 
     @staticmethod
     def _stamp(sim_time: float):
@@ -570,6 +645,50 @@ class ManualReplicatorCameraPublisher:
         msg.step = int(msg.width * (3 if encoding == 'rgb8' else 4))
         msg.data = contiguous.tobytes()
         return msg
+
+    @staticmethod
+    def camera_info_provenance(params) -> dict:
+        """Describe whether Replicator supplied usable, non-fallback intrinsics."""
+        result = {
+            'known_intrinsics': False,
+            'fallback_fx_fy_500': True,
+            'render_product_resolution_present': False,
+            'camera_focal_length_present': False,
+            'camera_aperture_present': False,
+        }
+        if not isinstance(params, dict):
+            return result
+        resolution = params.get('renderProductResolution')
+        focal = params.get('cameraFocalLength')
+        aperture = params.get('cameraAperture')
+        result['render_product_resolution_present'] = (
+            resolution is not None and hasattr(resolution, '__len__') and len(resolution) >= 2
+        )
+        result['camera_focal_length_present'] = focal is not None
+        result['camera_aperture_present'] = aperture is not None
+        try:
+            focal_x = float(focal[0] if hasattr(focal, '__len__') else focal)
+            focal_y = float(
+                focal[1]
+                if hasattr(focal, '__len__') and len(focal) > 1
+                else focal_x
+            )
+            aperture_x = float(
+                aperture[0] if hasattr(aperture, '__len__') else aperture
+            )
+            aperture_y = float(
+                aperture[1]
+                if hasattr(aperture, '__len__') and len(aperture) > 1
+                else aperture_x
+            )
+            result['known_intrinsics'] = all(
+                np.isfinite(value) and value > 0.0
+                for value in (focal_x, focal_y, aperture_x, aperture_y)
+            )
+        except Exception:
+            result['known_intrinsics'] = False
+        result['fallback_fx_fy_500'] = not result['known_intrinsics']
+        return result
 
     @staticmethod
     def _camera_info_msg(params, *, stamp, frame_id: str, width: int, height: int) -> sensor_msgs.msg.CameraInfo:
@@ -665,6 +784,7 @@ class ManualReplicatorCameraPublisher:
         return arr
 
     def _ensure_camera(self, spec: dict) -> dict | None:
+        """DEPRECATED manual writer/render-product initialization entry."""
         key = str(spec.get('key') or spec.get('camera_prim_path') or '')
         if not key:
             return None
@@ -707,7 +827,38 @@ class ManualReplicatorCameraPublisher:
             carb.log_warn(f'[run_isaacsim] Failed to initialize manual camera publisher for {spec}: {exc}')
             return None
 
+    def prepare(self) -> dict:
+        """Create one render product per registered spec without publishing.
+
+        This is intentionally separate from :meth:`publish` so a diagnostic can
+        warm Replicator while guaranteeing that warmup frames never receive a
+        new ROS timestamp or enter the qualified capture set.
+        """
+        try:
+            from arena_isaac.services.SpawnUsdRobot import get_vln_camera_publish_specs
+        except Exception as exc:
+            return {"pass": False, "camera_count": 0, "error": str(exc)}
+        states = []
+        for spec in get_vln_camera_publish_specs():
+            state = self._ensure_camera(spec)
+            if state is None:
+                return {
+                    "pass": False,
+                    "camera_count": len(states),
+                    "error": f"failed to prepare {spec.get('key')}",
+                }
+            states.append(state)
+        return {
+            "pass": bool(states),
+            "camera_count": len(states),
+            "render_product_paths": [
+                str(getattr(state["render_product"], "path", state["render_product"]))
+                for state in states
+            ],
+        }
+
     def publish(self, sim_time: float) -> None:
+        """DEPRECATED manual image publish entry; explicit backend only."""
         try:
             from arena_isaac.services.SpawnUsdRobot import get_vln_camera_publish_specs
         except Exception:
@@ -738,6 +889,47 @@ class ManualReplicatorCameraPublisher:
                         )
             except Exception as exc:
                 carb.log_warn(f"[run_isaacsim] Manual camera publish failed for {spec.get('key')}: {exc}")
+
+    def close(self) -> dict:
+        """Detach annotators and destroy every manual render product."""
+        evidence = {
+            'camera_count': len(self._cameras),
+            'annotators_detached': 0,
+            'render_products_destroyed': 0,
+            'errors': [],
+        }
+        for key, state in list(self._cameras.items()):
+            render_product = state.get('render_product')
+            for name in ('rgb_annot', 'depth_annot', 'params_annot'):
+                annotator = state.get(name)
+                if annotator is None:
+                    continue
+                try:
+                    annotator.detach(render_product)
+                    evidence['annotators_detached'] += 1
+                except Exception as first:
+                    try:
+                        annotator.detach([render_product])
+                        evidence['annotators_detached'] += 1
+                    except Exception as second:
+                        evidence['errors'].append(
+                            f'{key}:{name}:{type(first).__name__}:{first};'
+                            f'{type(second).__name__}:{second}'
+                        )
+            try:
+                if render_product is not None and hasattr(render_product, 'destroy'):
+                    render_product.destroy()
+                    evidence['render_products_destroyed'] += 1
+            except Exception as exc:
+                evidence['errors'].append(
+                    f'{key}:render_product:{type(exc).__name__}:{exc}'
+                )
+        self._cameras.clear()
+        evidence['pass'] = (
+            not evidence['errors']
+            and evidence['render_products_destroyed'] == evidence['camera_count']
+        )
+        return evidence
 
 
 # =================================================================================
@@ -1093,13 +1285,27 @@ def main(args=None):
     rclpy.init()
     controller = IsaacController()
     manual_step_state_pub = ManualStepStatePublisher(controller)
-    manual_camera_pub = ManualReplicatorCameraPublisher(controller)
+    camera_backend_session = freeze_camera_backend()
+    camera_backend = camera_backend_session.backend
+    carb.log_warn(
+        '[run_isaacsim] Camera backend frozen before episode: '
+        + json.dumps(camera_backend_session.manifest(), sort_keys=True)
+    )
+    dynamic_camera_tf_pub = DynamicCameraTfPublisher(controller)
+    manual_camera_pub = (
+        # DEPRECATED image path: default native does not instantiate this
+        # class. Explicit manual remains diagnostic/legacy and exclusive.
+        ManualReplicatorCameraPublisher(controller)
+        if manual_publishers_enabled(camera_backend)
+        else None
+    )
 
     # Subscribe to task lifecycle events to control when data collection happens
     def _on_task_reset(msg: std_msgs.msg.Int16):
         """task_generator fires this after each reset — treat as episode START.
         If there is leftover data from an interrupted episode, save it first."""
         nonlocal collecting, frame_step_counter
+        camera_backend_session.start_episode(msg.data)
         if not enable_logging or logger is None:
             return
 
@@ -1429,7 +1635,9 @@ def main(args=None):
                     )
                 manual_step_state_pub.publish(sim_time)
                 if should_render:
-                    manual_camera_pub.publish(sim_time)
+                    dynamic_camera_tf_pub.publish(sim_time)
+                    if manual_camera_pub is not None:
+                        manual_camera_pub.publish(sim_time)
                 step_elapsed = time.monotonic() - step_started
                 if step_elapsed >= 5.0:
                     carb.log_warn(

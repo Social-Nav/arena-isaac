@@ -3,6 +3,15 @@ import os
 import traceback
 
 import carb
+from isaac_utils.camera_publish_backend import (
+    camera_publish_backend,
+    manual_publishers_enabled,
+    spawnusdrobot_publishers_enabled,
+)
+from isaac_utils.camera_runtime_registry import (
+    CameraRuntimeRegistry,
+    camera_owner_token,
+)
 from isaac_utils.managers.door_manager import DoorManager
 
 def _safe_import(module_name, obj_name=None):
@@ -51,12 +60,87 @@ FRAME_KEYWORDS = {
     'odomframeid', 'chassisframeid',
 }
 BASE_FRAME_DEFAULT = 'base_link'
-_VLN_CAMERA_REPLICATOR_HANDLES = []
-_VLN_CAMERA_PUBLISH_SPECS = {}
+_VLN_CAMERA_RUNTIME = CameraRuntimeRegistry()
 
 
 def get_vln_camera_publish_specs() -> list[dict]:
-    return [dict(spec) for spec in _VLN_CAMERA_PUBLISH_SPECS.values()]
+    return _VLN_CAMERA_RUNTIME.image_records()
+
+
+def get_vln_camera_tf_specs() -> list[dict]:
+    return _VLN_CAMERA_RUNTIME.tf_records()
+
+
+def _detach_vln_camera_writer(writer) -> None:
+    detach = getattr(writer, 'detach', None)
+    if not callable(detach):
+        raise TypeError(f'native camera writer has no detach(): {type(writer)!r}')
+    # Isaac Sim 5.1 NodeWriter.detach is a no-argument API.  The render product
+    # is destroyed separately after every owned writer has detached.
+    detach()
+
+
+def _destroy_vln_camera_render_product(render_product) -> None:
+    destroy = getattr(render_product, 'destroy', None)
+    if not callable(destroy):
+        raise TypeError(
+            f'native camera render product has no destroy(): {type(render_product)!r}'
+        )
+    destroy()
+
+
+def unregister_vln_camera_robot(
+    robot_prim_path: str, *, fail_on_error: bool = True
+) -> dict:
+    """Remove only one robot's camera runtime state.
+
+    Failed handles remain registered for an exact retry.  Callers performing
+    robot replacement/deletion use ``fail_on_error=True`` so a live writer can
+    never be orphaned behind a newly reused prim path.
+    """
+    result = _VLN_CAMERA_RUNTIME.unregister_robot(
+        robot_prim_path,
+        detach_writer=_detach_vln_camera_writer,
+        destroy_render_product=_destroy_vln_camera_render_product,
+    )
+    if result['owners']:
+        level = carb.log_warn if result['pass'] else carb.log_error
+        level(
+            f'[SpawnUsdRobot] Camera runtime unregister robot={robot_prim_path} '
+            f'result={result}'
+        )
+    if fail_on_error and not result['pass']:
+        raise RuntimeError(
+            f'camera runtime cleanup failed for {robot_prim_path}: {result}'
+        )
+    return result
+
+
+def _reset_vln_camera_runtime_for_tests() -> None:
+    global _VLN_CAMERA_RUNTIME
+    _VLN_CAMERA_RUNTIME = CameraRuntimeRegistry()
+
+
+def _register_vln_camera_tf_spec(
+    *,
+    key: str,
+    camera_prim_path: str,
+    base_prim_path: str,
+    parent_frame: str,
+    child_frame: str,
+    robot_prim_path: str,
+    namespace: str,
+):
+    owner_token = camera_owner_token(robot_prim_path, namespace)
+    _VLN_CAMERA_RUNTIME.register_tf(key, {
+        'key': str(key),
+        'owner_token': owner_token,
+        'robot_prim_path': str(robot_prim_path),
+        'camera_prim_path': str(camera_prim_path),
+        'base_prim_path': str(base_prim_path),
+        'parent_frame': str(parent_frame),
+        'frame': str(child_frame),
+    })
 
 
 def _register_vln_camera_publish_spec(
@@ -69,10 +153,16 @@ def _register_vln_camera_publish_spec(
     frame: str,
     resolution: tuple[int, int],
     publish_depth: bool,
+    robot_prim_path: str | None = None,
+    base_prim_path: str | None = None,
+    base_frame: str | None = None,
+    parent_frame: str | None = None,
 ):
     topic_base = f"/{namespace.strip('/')}/{camera_topic.strip('/')}" if namespace else f"/{camera_topic.strip('/')}"
-    _VLN_CAMERA_PUBLISH_SPECS[key] = {
+    owner_token = camera_owner_token(str(robot_prim_path or ''), namespace)
+    _VLN_CAMERA_RUNTIME.register_image(key, {
         'key': key,
+        'owner_token': owner_token,
         'camera_prim_path': str(camera_prim_path),
         'namespace': str(namespace or ''),
         'camera_topic': str(camera_topic),
@@ -81,7 +171,11 @@ def _register_vln_camera_publish_spec(
         'frame': str(frame),
         'resolution': [int(resolution[0]), int(resolution[1])],
         'publish_depth': bool(publish_depth),
-    }
+        'robot_prim_path': str(robot_prim_path or ''),
+        'base_prim_path': str(base_prim_path or ''),
+        'base_frame': str(base_frame or ''),
+        'parent_frame': str(parent_frame or ''),
+    })
 
 
 def _normalize_robot_spawn_name(name: str) -> str:
@@ -791,6 +885,18 @@ def _find_named_camera_prim(prim_path: str, preferred_name: str) -> str | None:
     return first_camera
 
 
+def _find_named_prim(prim_path: str, preferred_name: str) -> str | None:
+    stage = omni.usd.get_context().get_stage()
+    root_prim = stage.GetPrimAtPath(prim_path)
+    if not root_prim or not root_prim.IsValid():
+        return None
+    preferred_lower = preferred_name.lower()
+    for prim in Usd.PrimRange(root_prim):
+        if prim.GetName().lower() == preferred_lower:
+            return str(prim.GetPath())
+    return None
+
+
 def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str:
     safe_name = prim_path.strip('/').replace('/', '_')
     top_down_camera_path = f'/World/vln_top_down_camera_{safe_name}'
@@ -834,7 +940,6 @@ def _ensure_top_down_camera(prim_path: str, request_pose, namespace: str) -> str
 
 
 def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str | None, request_pose) -> bool:
-    global _VLN_CAMERA_REPLICATOR_HANDLES
     if rep is None or sd is None or read_camera_info is None:
         carb.log_error('[SpawnUsdRobot] Cannot publish VLN cameras: Replicator/ROS2 bridge camera APIs unavailable')
         return False
@@ -845,6 +950,102 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
     chassis_frame = os.path.join(frame_namespace, 'chassis_camera') if frame_namespace else 'chassis_camera'
     top_down_frame = os.path.join(frame_namespace, 'top_down_camera') if frame_namespace else 'top_down_camera'
     step_size = 6  # Isaac default 60 Hz -> 10 Hz image streams.
+    backend = camera_publish_backend()
+    owner_token = camera_owner_token(prim_path, namespace)
+    base_prim_path = _find_named_prim(prim_path, base_frame_id)
+    if base_prim_path is None:
+        carb.log_error(
+            f'[SpawnUsdRobot] Dynamic camera TF cannot resolve base prim '
+            f'{base_frame_id!r} under {prim_path}'
+        )
+        return False
+
+    def configure_camera(
+        *,
+        key: str,
+        camera_prim_path: str,
+        camera_topic: str,
+        frame: str,
+        resolution: tuple[int, int],
+        publish_depth: bool,
+        rgb_topic_name: str = 'image',
+    ) -> None:
+        parent_frame = (
+            os.path.join(frame_namespace, base_frame_id)
+            if frame_namespace
+            else base_frame_id
+        )
+        _register_vln_camera_tf_spec(
+            key=key,
+            camera_prim_path=camera_prim_path,
+            base_prim_path=base_prim_path,
+            parent_frame=parent_frame,
+            child_frame=frame,
+            robot_prim_path=prim_path,
+            namespace=namespace,
+        )
+        if spawnusdrobot_publishers_enabled(backend):
+            render_product = rep.create.render_product(camera_prim_path, resolution)
+            _VLN_CAMERA_RUNTIME.add_handles(
+                owner_token,
+                prim_path,
+                [{'kind': 'render_product', 'value': render_product, 'key': key}],
+            )
+            camera_info_writer = _publish_camera_info(
+                render_product, frame, namespace, camera_topic, step_size
+            )
+            _VLN_CAMERA_RUNTIME.add_handles(
+                owner_token,
+                prim_path,
+                [{'kind': 'writer', 'value': camera_info_writer, 'key': key}],
+            )
+            rgb_writer = _publish_rgb(
+                render_product,
+                frame,
+                namespace,
+                camera_topic,
+                step_size,
+                rgb_topic_name,
+            )
+            _VLN_CAMERA_RUNTIME.add_handles(
+                owner_token,
+                prim_path,
+                [{'kind': 'writer', 'value': rgb_writer, 'key': key}],
+            )
+            if publish_depth:
+                depth_writers = _publish_depth(
+                    render_product, frame, namespace, camera_topic, step_size
+                )
+                _VLN_CAMERA_RUNTIME.add_handles(
+                    owner_token,
+                    prim_path,
+                    [
+                        {'kind': 'writer', 'value': writer, 'key': key}
+                        for writer in depth_writers
+                    ],
+                )
+        if manual_publishers_enabled(backend):
+            # DEPRECATED manual image writer registration.  It is reachable
+            # only through explicit exclusive manual selection; native is the
+            # project default and never registers this publisher spec.
+            _register_vln_camera_publish_spec(
+                key=key,
+                camera_prim_path=camera_prim_path,
+                namespace=namespace,
+                camera_topic=camera_topic,
+                rgb_topic_name=rgb_topic_name,
+                frame=frame,
+                resolution=resolution,
+                publish_depth=publish_depth,
+                robot_prim_path=prim_path,
+                base_prim_path=base_prim_path,
+                base_frame=base_frame_id,
+                parent_frame=parent_frame,
+            )
+        carb.log_warn(
+            f'[SpawnUsdRobot] Camera backend={backend} prim={camera_prim_path} '
+            f'topic=/{namespace}/{camera_topic}/* frame={frame}'
+        )
 
     head_camera_path = _find_named_camera_prim(prim_path, 'head_camera')
     if head_camera_path is None:
@@ -853,26 +1054,17 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
     else:
         try:
             head_resolution = (640, 480)
-            head_rp = rep.create.render_product(head_camera_path, head_resolution)
-            head_handles = [
-                head_rp,
-                _publish_camera_info(head_rp, head_frame, namespace, 'head_camera', step_size),
-                _publish_rgb(head_rp, head_frame, namespace, 'head_camera', step_size),
-                *_publish_depth(head_rp, head_frame, namespace, 'head_camera', step_size),
-            ]
-            _VLN_CAMERA_REPLICATOR_HANDLES.extend(head_handles)
-            _register_vln_camera_publish_spec(
+            configure_camera(
                 key=f'{namespace}:head_camera',
                 camera_prim_path=head_camera_path,
-                namespace=namespace,
                 camera_topic='head_camera',
                 frame=head_frame,
                 resolution=head_resolution,
                 publish_depth=True,
             )
-            carb.log_warn(f'[SpawnUsdRobot] Publishing head camera {head_camera_path} on /{namespace}/head_camera/*')
         except Exception as e:
             carb.log_error(f'[SpawnUsdRobot] Failed to create head_camera ROS publishers: {e}\n{traceback.format_exc()}')
+            unregister_vln_camera_robot(prim_path, fail_on_error=False)
             return False
 
     chassis_camera_path = _find_named_camera_prim(prim_path, 'chassis_camera')
@@ -881,51 +1073,34 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
     else:
         try:
             chassis_resolution = (640, 480)
-            chassis_rp = rep.create.render_product(chassis_camera_path, chassis_resolution)
-            chassis_handles = [
-                chassis_rp,
-                _publish_camera_info(chassis_rp, chassis_frame, namespace, 'chassis_camera', step_size),
-                _publish_rgb(chassis_rp, chassis_frame, namespace, 'chassis_camera', step_size, 'rgb'),
-                *_publish_depth(chassis_rp, chassis_frame, namespace, 'chassis_camera', step_size),
-            ]
-            _VLN_CAMERA_REPLICATOR_HANDLES.extend(chassis_handles)
-            _register_vln_camera_publish_spec(
+            configure_camera(
                 key=f'{namespace}:chassis_camera',
                 camera_prim_path=chassis_camera_path,
-                namespace=namespace,
                 camera_topic='chassis_camera',
                 rgb_topic_name='rgb',
                 frame=chassis_frame,
                 resolution=chassis_resolution,
                 publish_depth=True,
             )
-            carb.log_warn(f'[SpawnUsdRobot] Publishing chassis camera {chassis_camera_path} on /{namespace}/chassis_camera/*')
         except Exception as e:
             carb.log_error(f'[SpawnUsdRobot] Failed to create chassis_camera ROS publishers: {e}\n{traceback.format_exc()}')
+            unregister_vln_camera_robot(prim_path, fail_on_error=False)
             return False
 
     try:
         top_down_path = _ensure_top_down_camera(prim_path, request_pose, namespace)
         top_resolution = (640, 640)
-        top_rp = rep.create.render_product(top_down_path, top_resolution)
-        top_handles = [
-            top_rp,
-            _publish_camera_info(top_rp, top_down_frame, namespace, 'top_down_camera', step_size),
-            _publish_rgb(top_rp, top_down_frame, namespace, 'top_down_camera', step_size),
-        ]
-        _VLN_CAMERA_REPLICATOR_HANDLES.extend(top_handles)
-        _register_vln_camera_publish_spec(
+        configure_camera(
             key=f'{namespace}:top_down_camera',
             camera_prim_path=top_down_path,
-            namespace=namespace,
             camera_topic='top_down_camera',
             frame=top_down_frame,
             resolution=top_resolution,
             publish_depth=False,
         )
-        carb.log_warn(f'[SpawnUsdRobot] Publishing top-down camera {top_down_path} on /{namespace}/top_down_camera/*')
     except Exception as e:
         carb.log_error(f'[SpawnUsdRobot] Failed to create top_down_camera ROS publishers: {e}\n{traceback.format_exc()}')
+        unregister_vln_camera_robot(prim_path, fail_on_error=False)
         return False
 
     return True
@@ -1053,6 +1228,11 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
     prim_path = world_path(name)
     ensure_path(os.path.dirname(prim_path))
 
+    # A same-path respawn is a replacement boundary. Detach the old native
+    # writers and remove only this robot's image/TF records before the prim can
+    # be reused. Cleanup failure aborts the spawn and retains failed handles.
+    unregister_vln_camera_robot(prim_path, fail_on_error=True)
+
     create_prim_safe(
         prim_path=prim_path,
         usd_path=usd_path,
@@ -1139,9 +1319,11 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
         camera_publishers_ready = _setup_vln_camera_publishers(prim_path, namespace, base_frame, request.pose)
         if require_vln_cameras and not camera_publishers_ready:
             carb.log_error('[SpawnUsdRobot] Required VLN camera publishers were not created; spawn aborted.')
+            unregister_vln_camera_robot(prim_path, fail_on_error=False)
             return ''
     except Exception as e:
         carb.log_error(f"[SpawnUsdRobot] VLN camera publisher setup failed: {e}\n{traceback.format_exc()}")
+        unregister_vln_camera_robot(prim_path, fail_on_error=False)
         return ''
 
     try:
@@ -1189,6 +1371,7 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
                 odom_topic=odom_topic,
             ):
                 carb.log_error('[SpawnUsdRobot] Failed to create odom graph')
+                unregister_vln_camera_robot(prim_path, fail_on_error=False)
                 return ''
         else:
             carb.log_warn(
@@ -1198,6 +1381,7 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
 
     except Exception as e:
         carb.log_error(f"[SpawnUsdRobot] Graph setup failed: {e}\n{traceback.format_exc()}")
+        unregister_vln_camera_robot(prim_path, fail_on_error=False)
         return ''
 
     geom.register_robot(
@@ -1230,4 +1414,4 @@ spawn_usd_robot_service = Service(
     callback=spawn_usd_robot_callback,
 )
 
-__all__ = ['spawn_usd_robot_service']
+__all__ = ['spawn_usd_robot_service', 'unregister_vln_camera_robot']

@@ -5,6 +5,7 @@ from isaacsim.core.experimental.prims import Prim
 
 from isaacsim_msgs.srv import DeletePrims
 
+from .SpawnUsdRobot import unregister_vln_camera_robot
 from .utils import Service, on_exception
 
 
@@ -22,6 +23,10 @@ def _coerce_resolved_path(value) -> str | None:
 @on_exception(False)
 def delete_prim(name: str) -> bool:
     target = world_path(name)
+    # Cleanup is keyed by the exact requested robot prim path and runs even if
+    # USD path resolution no longer finds the prim. A live handle cleanup error
+    # fails closed before the prim can be destroyed underneath it.
+    unregister_vln_camera_robot(target, fail_on_error=True)
     target = _coerce_resolved_path(Prim.resolve_paths([target]))
     if not target:
         return True
