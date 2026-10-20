@@ -14,11 +14,12 @@ from isaac_utils.camera_runtime_registry import (
 )
 from isaac_utils.managers.door_manager import DoorManager
 from isaac_utils.odom_ownership import (
+    assess_graph_disable_nodes,
     isaac_graph_enabled,
     odom_owner_token,
     odom_publish_backend,
     register_odom_owner,
-    unregister_odom_robot as unregister_odom_owner_registry,
+    unregister_odom_robot_after_graph_disable,
 )
 
 def _safe_import(module_name, obj_name=None):
@@ -416,7 +417,7 @@ ODOM_PUBLISHER_TYPES = {
 }
 
 
-def _disable_odom_graph_tf(prim_path: str) -> int:
+def _disable_odom_graph_tf(prim_path: str) -> dict:
     """Disable TF and odom publishers from USD-embedded OmniGraph nodes.
 
     The arena framework creates its own odom OmniGraph via odom.py which
@@ -425,16 +426,26 @@ def _disable_odom_graph_tf(prim_path: str) -> int:
     both will publish conflicting transforms for the same frames, causing
     TF flickering and laser scan distortion.
 
-    This function disables all ROS2PublishRawTransformTree and
-    ROS2PublishOdometry nodes found under prim_path by setting their
-    topicName to a dead topic.
+    Every targeted node receives a deterministic dead topic and is then read
+    back through both the authored USD attribute and live OmniGraph API. Any
+    set/readback failure remains in the returned ledger and blocks robot
+    replacement/deletion.
     """
     stage = omni.usd.get_context().get_stage()
     root_prim = stage.GetPrimAtPath(prim_path)
     if not root_prim or not root_prim.IsValid():
-        return 0
+        return {
+            "schema": "arena.odom_graph_disable_ledger.v1",
+            "robot_prim_path": prim_path,
+            "root_present": False,
+            "targeted_node_count": 0,
+            "disabled_and_verified_count": 0,
+            "failed_node_count": 0,
+            "nodes": [],
+            "pass": True,
+        }
 
-    disabled = 0
+    node_results = []
     target_types = TF_PUBLISHER_TYPES | ODOM_PUBLISHER_TYPES
     for prim in Usd.PrimRange(root_prim):
         if 'OmniGraph' not in prim.GetTypeName():
@@ -447,43 +458,85 @@ def _disable_odom_graph_tf(prim_path: str) -> int:
         if node_type not in target_types:
             continue
 
-        # Disable by renaming topicName to a dead topic
+        prim_path_str = str(prim.GetPath())
         topic_attr = prim.GetAttribute('inputs:topicName')
-        if topic_attr and topic_attr.IsValid():
-            old_val = topic_attr.Get()
-            if old_val and not str(old_val).endswith('__disabled'):
-                topic_attr.Set(f"{old_val}__disabled")
-                carb.log_warn(
-                    f"[SpawnUsdRobot] Disabled {node_type.split('.')[-1]} "
-                    f"topic '{old_val}' on {prim.GetPath()}"
-                )
-                disabled += 1
-                continue
-
-        # For TF publishers that publish to /tf by default (no topicName attr),
-        # create and set a dead topicName
-        try:
-            if not topic_attr or not topic_attr.IsValid():
-                prim.CreateAttribute('inputs:topicName', Sdf.ValueTypeNames.String).Set('/tf__disabled')
-            else:
-                topic_attr.Set('/tf__disabled')
-            carb.log_warn(
-                f"[SpawnUsdRobot] Disabled {node_type.split('.')[-1]} "
-                f"(no topicName) on {prim.GetPath()}"
-            )
-            disabled += 1
-        except Exception as e:
-            carb.log_warn(
-                f"[SpawnUsdRobot] Failed to disable {node_type.split('.')[-1]} "
-                f"on {prim.GetPath()}: {e}"
-            )
-
-    if disabled:
-        carb.log_warn(
-            f"[SpawnUsdRobot] Disabled {disabled} USD-embedded TF/odom "
-            f"publisher(s) under {prim_path}"
+        had_topic_name = bool(topic_attr and topic_attr.IsValid())
+        authored_before = topic_attr.Get() if had_topic_name else None
+        runtime_before = _get_og_attr_value(prim_path_str, 'inputs:topicName')
+        default_live_topic = (
+            '/tf' if node_type in TF_PUBLISHER_TYPES else '/odom'
         )
-    return disabled
+        dead_topic = (
+            '/__arena_disabled_odom_tf/'
+            + prim_path_str.strip('/').replace('/', '_')
+        )
+        errors = []
+        set_succeeded = False
+        try:
+            if not had_topic_name:
+                topic_attr = prim.CreateAttribute(
+                    'inputs:topicName', Sdf.ValueTypeNames.String
+                )
+            set_result = topic_attr.Set(dead_topic)
+            if set_result is False:
+                raise RuntimeError('topicName Set returned False')
+            set_succeeded = True
+            carb.log_warn(
+                f"[SpawnUsdRobot] Disabled {node_type.split('.')[-1]} on "
+                f"{prim_path_str}: live={runtime_before or authored_before or default_live_topic!r} "
+                f"dead={dead_topic!r}"
+            )
+        except Exception as e:
+            errors.append(f"set:{type(e).__name__}:{e}")
+            carb.log_error(
+                f"[SpawnUsdRobot] Failed to disable {node_type.split('.')[-1]} "
+                f"on {prim_path_str}: {e}"
+            )
+        authored_after = None
+        runtime_after = None
+        try:
+            authored_after = (
+                topic_attr.Get() if topic_attr and topic_attr.IsValid() else None
+            )
+        except Exception as e:
+            errors.append(f"authored_readback:{type(e).__name__}:{e}")
+        try:
+            live_node = og.get_node_by_path(prim_path_str)
+            if live_node and live_node.is_valid():
+                live_attr = live_node.get_attribute('inputs:topicName')
+                if not live_attr or not live_attr.is_valid():
+                    raise RuntimeError('live OmniGraph topicName attribute missing')
+                runtime_after = live_attr.get()
+        except Exception as e:
+            errors.append(f"runtime_readback:{type(e).__name__}:{e}")
+        node_results.append({
+            "node_path": prim_path_str,
+            "node_type": node_type,
+            "had_topic_name": had_topic_name,
+            "default_live_topic": default_live_topic,
+            "authored_topic_before": (
+                None if authored_before is None else str(authored_before)
+            ),
+            "runtime_topic_before": (
+                None if runtime_before is None else str(runtime_before)
+            ),
+            "dead_topic": dead_topic,
+            "set_succeeded": set_succeeded,
+            "authored_topic_after": (
+                None if authored_after is None else str(authored_after)
+            ),
+            "runtime_topic_after": (
+                None if runtime_after is None else str(runtime_after)
+            ),
+            "errors": errors,
+        })
+
+    result = assess_graph_disable_nodes(node_results)
+    result["robot_prim_path"] = prim_path
+    result["root_present"] = True
+    level = carb.log_warn if result["pass"] else carb.log_error
+    level(f"[SpawnUsdRobot] Odom/TF graph disable result: {result}")
+    return result
 
 
 def unregister_odom_robot(
@@ -495,17 +548,12 @@ def unregister_odom_robot(
     # graph left by a process version that predates the ownership registry.
     # The manual publisher's exact DDS handle is destroyed by its registry
     # cleanup callback.  No broad topic or process cleanup is used.
-    disabled_graph_publishers = _disable_odom_graph_tf(robot_prim_path)
-    graph_odom_residual = _has_odom_publisher(robot_prim_path, '')
-    if graph_odom_residual and fail_on_error:
-        raise RuntimeError(
-            f'odom graph publisher remains active for {robot_prim_path} after exact disable'
-        )
-    result = unregister_odom_owner_registry(
-        robot_prim_path, fail_on_error=fail_on_error
+    graph_disable = _disable_odom_graph_tf(robot_prim_path)
+    result = unregister_odom_robot_after_graph_disable(
+        robot_prim_path,
+        graph_disable,
+        fail_on_error=fail_on_error,
     )
-    result["graph_publishers_disabled"] = disabled_graph_publishers
-    result["graph_odom_residual"] = graph_odom_residual
     return result
 
 
@@ -1384,7 +1432,11 @@ def spawn_usd_robot(request: SpawnUsdRobot_srv.Request) -> str:
 
         odom_topic = f"/{namespace.lstrip('/')}/odom" if namespace else "/odom"
 
-        _disable_odom_graph_tf(prim_path)
+        embedded_graph_disable = _disable_odom_graph_tf(prim_path)
+        if not embedded_graph_disable['pass']:
+            raise RuntimeError(
+                f'embedded odom/TF graph disable failed: {embedded_graph_disable}'
+            )
 
         # Odom ownership is frozen process-wide before any robot is spawned.
         # The Python step backend and Isaac graph are mutually exclusive; a

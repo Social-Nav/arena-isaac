@@ -21,7 +21,10 @@ def test_spawn_uses_one_exclusive_backend_and_registers_actual_frames():
     assert "base_frame=fq_base_frame" in source
     assert "source_prim_path=odom_prim_path" in source
     assert "enable_isaac_odom_graph =" not in source
-    assert "graph_odom_residual = _has_odom_publisher" in source
+    assert "assess_graph_disable_nodes(node_results)" in source
+    assert "runtime_topic_after" in source
+    assert "live_node.get_attribute('inputs:topicName')" in source
+    assert "unregister_odom_robot_after_graph_disable" in source
 
 
 def test_respawn_and_delete_cleanup_odom_before_prim_reuse_or_destroy():

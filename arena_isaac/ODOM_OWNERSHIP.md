@@ -34,8 +34,11 @@ odom backend switch.
 
 Same-path respawn and DeletePrims unregister the exact robot owner before prim
 reuse/destruction. Manual DDS publishers are destroyed through exact retained
-handles; graph publishers under that robot are disabled before registry
-removal. Cleanup failure retains ownership and blocks replacement.
+handles. Every targeted graph Odometry/TF node is assigned a deterministic dead
+topic and read back through both its authored USD attribute and live OmniGraph
+attribute before registry removal. Any Set/readback error or partial success
+retains ownership and blocks replacement; a TF failure cannot be hidden by a
+successful Odometry-topic check.
 
 A qualification ledger must independently prove:
 

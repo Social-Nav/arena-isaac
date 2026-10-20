@@ -5,6 +5,7 @@ from isaac_utils.odom_ownership import (
     LEGACY_GRAPH_ENV_NAME,
     OdomOwnershipRegistry,
     _reset_odom_ownership_for_tests,
+    assess_graph_disable_nodes,
     freeze_odom_backend,
     isaac_graph_enabled,
     manual_step_enabled,
@@ -124,6 +125,111 @@ def test_cleanup_failure_retains_owner_and_blocks_replacement():
     assert registry.records() == [spec]
     with pytest.raises(ValueError, match="must be unregistered"):
         registry.register(dict(spec, source_prim_path="/new"))
+
+
+def _graph_node(
+    *,
+    path="/World/Robot/Graph/PublishTf",
+    node_type="isaacsim.ros2.bridge.ROS2PublishRawTransformTree",
+    had_topic_name=True,
+    set_succeeded=True,
+    dead_topic="/__arena_disabled_odom_tf/node",
+    authored_after="/__arena_disabled_odom_tf/node",
+    runtime_after="/__arena_disabled_odom_tf/node",
+    errors=None,
+):
+    return {
+        "node_path": path,
+        "node_type": node_type,
+        "had_topic_name": had_topic_name,
+        "dead_topic": dead_topic,
+        "set_succeeded": set_succeeded,
+        "authored_topic_after": authored_after,
+        "runtime_topic_after": runtime_after,
+        "errors": list(errors or []),
+    }
+
+
+def test_tf_without_topic_name_passes_only_after_dead_topic_readback():
+    result = assess_graph_disable_nodes(
+        [_graph_node(had_topic_name=False, runtime_after=None)]
+    )
+    assert result["pass"] is True
+    assert result["nodes"][0]["authored_verified"] is True
+    assert result["nodes"][0]["runtime_verified"] is True
+
+
+def test_tf_disable_exception_retains_owner_and_blocks_replacement():
+    registry = OdomOwnershipRegistry()
+    spec = _spec()
+    registry.register(spec)
+    graph_result = assess_graph_disable_nodes(
+        [
+            _graph_node(
+                set_succeeded=False,
+                authored_after="/tf",
+                runtime_after="/tf",
+                errors=["set:RuntimeError:fixture"],
+            )
+        ]
+    )
+    result = registry.unregister_robot_after_graph_disable(
+        spec["robot_prim_path"], graph_result
+    )
+    assert result["pass"] is False
+    assert result["registry_cleanup_skipped"] is True
+    assert result["owner_retained"] is True
+    assert registry.records() == [spec]
+    with pytest.raises(ValueError, match="must be unregistered"):
+        registry.register(dict(spec, source_prim_path="/new"))
+
+
+def test_partial_odom_tf_disable_retains_owner():
+    registry = OdomOwnershipRegistry()
+    spec = _spec()
+    registry.register(spec)
+    graph_result = assess_graph_disable_nodes(
+        [
+            _graph_node(
+                path="/World/Robot/Graph/PublishOdom",
+                node_type="isaacsim.ros2.bridge.ROS2PublishOdometry",
+            ),
+            _graph_node(
+                path="/World/Robot/Graph/PublishTf",
+                set_succeeded=True,
+                authored_after="/__arena_disabled_odom_tf/node",
+                runtime_after="/tf",
+            ),
+        ]
+    )
+    assert graph_result["disabled_and_verified_count"] == 1
+    assert graph_result["failed_node_count"] == 1
+    result = registry.unregister_robot_after_graph_disable(
+        spec["robot_prim_path"], graph_result
+    )
+    assert result["pass"] is False
+    assert registry.records() == [spec]
+
+
+def test_all_odom_tf_nodes_verified_then_exact_owner_cleanup_runs():
+    registry = OdomOwnershipRegistry()
+    spec = _spec()
+    registry.register(spec)
+    events = []
+    registry.add_cleanup(spec["owner_token"], lambda: events.append("destroy-gid"))
+    graph_result = assess_graph_disable_nodes(
+        [
+            _graph_node(node_type="isaacsim.ros2.bridge.ROS2PublishOdometry"),
+            _graph_node(had_topic_name=False, runtime_after=None),
+        ]
+    )
+    result = registry.unregister_robot_after_graph_disable(
+        spec["robot_prim_path"], graph_result
+    )
+    assert result["pass"] is True
+    assert result["registry_cleanup_skipped"] is False
+    assert events == ["destroy-gid"]
+    assert registry.records() == []
 
 
 def test_v3_dual_frame_fixture_fails_deterministically():

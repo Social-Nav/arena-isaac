@@ -203,6 +203,33 @@ class OdomOwnershipRegistry:
             "pass": all(item["pass"] for item in results),
         }
 
+    def unregister_robot_after_graph_disable(
+        self, robot_prim_path: str, graph_disable: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Keep the owner intact unless every odom/TF graph node is dead."""
+
+        robot = str(robot_prim_path).rstrip("/")
+        owners = sorted(
+            owner
+            for owner, record in self.records_by_owner.items()
+            if str(record["robot_prim_path"]).rstrip("/") == robot
+        )
+        if graph_disable.get("pass") is not True:
+            return {
+                "robot_prim_path": robot,
+                "owners": owners,
+                "results": [],
+                "graph_disable": dict(graph_disable),
+                "registry_cleanup_skipped": True,
+                "owner_retained": bool(owners),
+                "pass": False,
+            }
+        result = self.unregister_robot(robot)
+        result["graph_disable"] = dict(graph_disable)
+        result["registry_cleanup_skipped"] = False
+        result["owner_retained"] = not result["pass"] and bool(owners)
+        return result
+
 
 _RUNTIME_REGISTRY = OdomOwnershipRegistry()
 
@@ -225,6 +252,59 @@ def unregister_odom_robot(
     result = _RUNTIME_REGISTRY.unregister_robot(robot_prim_path)
     if fail_on_error and not result["pass"]:
         raise RuntimeError(f"odom ownership cleanup failed for {robot_prim_path}: {result}")
+    return result
+
+
+def assess_graph_disable_nodes(nodes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Build a structured fail-closed ledger for targeted odom/TF publishers."""
+
+    normalized: list[dict[str, Any]] = []
+    for value in nodes:
+        record = dict(value)
+        dead_topic = str(record.get("dead_topic") or "")
+        authored_after = str(record.get("authored_topic_after") or "")
+        runtime_after_value = record.get("runtime_topic_after")
+        runtime_after = (
+            None if runtime_after_value is None else str(runtime_after_value)
+        )
+        errors = [str(item) for item in record.get("errors", [])]
+        set_succeeded = record.get("set_succeeded") is True
+        authored_verified = bool(dead_topic) and authored_after == dead_topic
+        runtime_verified = runtime_after in {None, dead_topic}
+        record["errors"] = errors
+        record["dead_topic"] = dead_topic
+        record["authored_topic_after"] = authored_after
+        record["runtime_topic_after"] = runtime_after
+        record["authored_verified"] = authored_verified
+        record["runtime_verified"] = runtime_verified
+        record["pass"] = bool(
+            set_succeeded and authored_verified and runtime_verified and not errors
+        )
+        normalized.append(record)
+    failed = [record for record in normalized if not record["pass"]]
+    return {
+        "schema": "arena.odom_graph_disable_ledger.v1",
+        "targeted_node_count": len(normalized),
+        "disabled_and_verified_count": len(normalized) - len(failed),
+        "failed_node_count": len(failed),
+        "nodes": normalized,
+        "pass": not failed,
+    }
+
+
+def unregister_odom_robot_after_graph_disable(
+    robot_prim_path: str,
+    graph_disable: Mapping[str, Any],
+    *,
+    fail_on_error: bool = True,
+) -> dict[str, Any]:
+    result = _RUNTIME_REGISTRY.unregister_robot_after_graph_disable(
+        robot_prim_path, graph_disable
+    )
+    if fail_on_error and not result["pass"]:
+        raise RuntimeError(
+            f"odom/TF graph cleanup failed for {robot_prim_path}: {result}"
+        )
     return result
 
 
