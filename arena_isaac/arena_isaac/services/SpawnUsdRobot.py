@@ -494,6 +494,8 @@ def _disable_odom_graph_tf(prim_path: str) -> dict:
             )
         authored_after = None
         runtime_after = None
+        live_node_present = False
+        live_attr_present = False
         try:
             authored_after = (
                 topic_attr.Get() if topic_attr and topic_attr.IsValid() else None
@@ -503,9 +505,11 @@ def _disable_odom_graph_tf(prim_path: str) -> dict:
         try:
             live_node = og.get_node_by_path(prim_path_str)
             if live_node and live_node.is_valid():
+                live_node_present = True
                 live_attr = live_node.get_attribute('inputs:topicName')
                 if not live_attr or not live_attr.is_valid():
                     raise RuntimeError('live OmniGraph topicName attribute missing')
+                live_attr_present = True
                 runtime_after = live_attr.get()
         except Exception as e:
             errors.append(f"runtime_readback:{type(e).__name__}:{e}")
@@ -528,6 +532,8 @@ def _disable_odom_graph_tf(prim_path: str) -> dict:
             "runtime_topic_after": (
                 None if runtime_after is None else str(runtime_after)
             ),
+            "live_node_present": live_node_present,
+            "live_attr_present": live_attr_present,
             "errors": errors,
         })
 

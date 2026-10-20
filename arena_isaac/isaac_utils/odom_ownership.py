@@ -267,14 +267,28 @@ def assess_graph_disable_nodes(nodes: Sequence[Mapping[str, Any]]) -> dict[str, 
         runtime_after = (
             None if runtime_after_value is None else str(runtime_after_value)
         )
+        live_node_value = record.get("live_node_present")
+        live_attr_value = record.get("live_attr_present")
+        presence_recorded = isinstance(live_node_value, bool) and isinstance(
+            live_attr_value, bool
+        )
+        live_node_present = live_node_value is True
+        live_attr_present = live_attr_value is True
         errors = [str(item) for item in record.get("errors", [])]
         set_succeeded = record.get("set_succeeded") is True
         authored_verified = bool(dead_topic) and authored_after == dead_topic
-        runtime_verified = runtime_after in {None, dead_topic}
+        if live_node_present:
+            runtime_verified = live_attr_present and runtime_after == dead_topic
+        else:
+            runtime_verified = not live_attr_present and runtime_after is None
+        runtime_verified = bool(presence_recorded and runtime_verified)
         record["errors"] = errors
         record["dead_topic"] = dead_topic
         record["authored_topic_after"] = authored_after
         record["runtime_topic_after"] = runtime_after
+        record["presence_recorded"] = presence_recorded
+        record["live_node_present"] = live_node_present
+        record["live_attr_present"] = live_attr_present
         record["authored_verified"] = authored_verified
         record["runtime_verified"] = runtime_verified
         record["pass"] = bool(

@@ -36,9 +36,13 @@ Same-path respawn and DeletePrims unregister the exact robot owner before prim
 reuse/destruction. Manual DDS publishers are destroyed through exact retained
 handles. Every targeted graph Odometry/TF node is assigned a deterministic dead
 topic and read back through both its authored USD attribute and live OmniGraph
-attribute before registry removal. Any Set/readback error or partial success
-retains ownership and blocks replacement; a TF failure cannot be hidden by a
-successful Odometry-topic check.
+attribute before registry removal. The ledger distinguishes an absent live node
+from a present node, a present/missing live attribute, and the attribute value.
+Only an explicitly absent live node may omit runtime readback; a present node
+requires a present attribute whose value exactly equals the dead topic. Any
+Set/readback error, `None`/empty/old live value, or partial success retains
+ownership and blocks replacement; a TF failure cannot be hidden by a successful
+Odometry-topic check.
 
 A qualification ledger must independently prove:
 

@@ -136,6 +136,8 @@ def _graph_node(
     dead_topic="/__arena_disabled_odom_tf/node",
     authored_after="/__arena_disabled_odom_tf/node",
     runtime_after="/__arena_disabled_odom_tf/node",
+    live_node_present=True,
+    live_attr_present=True,
     errors=None,
 ):
     return {
@@ -146,17 +148,73 @@ def _graph_node(
         "set_succeeded": set_succeeded,
         "authored_topic_after": authored_after,
         "runtime_topic_after": runtime_after,
+        "live_node_present": live_node_present,
+        "live_attr_present": live_attr_present,
         "errors": list(errors or []),
     }
 
 
-def test_tf_without_topic_name_passes_only_after_dead_topic_readback():
+def test_tf_without_topic_name_passes_only_after_exact_live_dead_topic_readback():
     result = assess_graph_disable_nodes(
-        [_graph_node(had_topic_name=False, runtime_after=None)]
+        [_graph_node(had_topic_name=False)]
     )
     assert result["pass"] is True
     assert result["nodes"][0]["authored_verified"] is True
     assert result["nodes"][0]["runtime_verified"] is True
+
+
+def test_live_node_present_with_none_readback_fails_and_retains_owner():
+    registry = OdomOwnershipRegistry()
+    spec = _spec()
+    registry.register(spec)
+    graph_result = assess_graph_disable_nodes(
+        [_graph_node(live_node_present=True, live_attr_present=True, runtime_after=None)]
+    )
+    assert graph_result["pass"] is False
+    assert graph_result["nodes"][0]["runtime_verified"] is False
+    result = registry.unregister_robot_after_graph_disable(
+        spec["robot_prim_path"], graph_result
+    )
+    assert result["owner_retained"] is True
+    assert registry.records() == [spec]
+
+
+def test_live_node_present_with_missing_live_attr_fails():
+    result = assess_graph_disable_nodes(
+        [
+            _graph_node(
+                live_node_present=True,
+                live_attr_present=False,
+                runtime_after=None,
+                errors=["runtime_readback:RuntimeError:missing"],
+            )
+        ]
+    )
+    assert result["pass"] is False
+    assert result["nodes"][0]["live_node_present"] is True
+    assert result["nodes"][0]["live_attr_present"] is False
+
+
+def test_live_node_absent_allows_no_runtime_readback():
+    result = assess_graph_disable_nodes(
+        [
+            _graph_node(
+                live_node_present=False,
+                live_attr_present=False,
+                runtime_after=None,
+            )
+        ]
+    )
+    assert result["pass"] is True
+    assert result["nodes"][0]["runtime_verified"] is True
+
+
+def test_live_node_exact_dead_topic_readback_passes():
+    result = assess_graph_disable_nodes([_graph_node()])
+    assert result["pass"] is True
+    assert result["nodes"][0]["runtime_topic_after"] == result["nodes"][0][
+        "dead_topic"
+    ]
 
 
 def test_tf_disable_exception_retains_owner_and_blocks_replacement():
@@ -220,7 +278,12 @@ def test_all_odom_tf_nodes_verified_then_exact_owner_cleanup_runs():
     graph_result = assess_graph_disable_nodes(
         [
             _graph_node(node_type="isaacsim.ros2.bridge.ROS2PublishOdometry"),
-            _graph_node(had_topic_name=False, runtime_after=None),
+            _graph_node(
+                had_topic_name=False,
+                live_node_present=False,
+                live_attr_present=False,
+                runtime_after=None,
+            ),
         ]
     )
     result = registry.unregister_robot_after_graph_disable(

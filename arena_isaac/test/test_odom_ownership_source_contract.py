@@ -24,6 +24,8 @@ def test_spawn_uses_one_exclusive_backend_and_registers_actual_frames():
     assert "assess_graph_disable_nodes(node_results)" in source
     assert "runtime_topic_after" in source
     assert "live_node.get_attribute('inputs:topicName')" in source
+    assert '"live_node_present": live_node_present' in source
+    assert '"live_attr_present": live_attr_present' in source
     assert "unregister_odom_robot_after_graph_disable" in source
 
 
