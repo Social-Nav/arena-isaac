@@ -49,6 +49,15 @@ def test_image_echo_is_instantiated_next_to_the_dynamic_tf_publisher():
     assert dynamic < echo
 
 
+def test_image_echo_subscribes_lazily_after_robot_spawn():
+    source = _source()
+    assert "def sync(self) -> None:" in source
+    assert "key in self._subscribed_keys" in source
+    assert "camera_tf_image_echo.sync()" in source
+    # The registry is populated by the SpawnUsdRobot service, after construction.
+    assert "camera_tf_image_echo.sync()" in source[source.index("while simulation_app.is_running():"):]
+
+
 def test_main_loop_keeps_the_render_cadence_tf_sample():
     source = _source()
     assert "dynamic_camera_tf_pub.publish(sim_time)" in source

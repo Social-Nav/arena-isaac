@@ -634,6 +634,14 @@ class CameraTfImageEcho:
         self._node = node
         self._tf_publisher = tf_publisher
         self._subscriptions = []
+        self._subscribed_keys: set[str] = set()
+        # The camera runtime registry is populated later, when the SpawnUsdRobot
+        # service creates the render products, so the first sync is usually a
+        # no-op.  The main loop calls sync() again after the robot exists.
+        self.sync()
+
+    def sync(self) -> None:
+        """Subscribe to any camera RGB stream registered since the last sync."""
         try:
             from arena_isaac.services.SpawnUsdRobot import get_vln_camera_publish_specs
         except Exception as exc:
@@ -643,7 +651,7 @@ class CameraTfImageEcho:
             key = str(spec.get('key') or '')
             topic_base = str(spec.get('topic_base') or '')
             rgb_name = str(spec.get('rgb_topic_name') or 'image').strip('/')
-            if not key or not topic_base or not rgb_name:
+            if not key or not topic_base or not rgb_name or key in self._subscribed_keys:
                 continue
             topic = f"{topic_base.rstrip('/')}/{rgb_name}"
             qos = QoSProfile(
@@ -651,13 +659,14 @@ class CameraTfImageEcho:
                 reliability=ReliabilityPolicy.BEST_EFFORT,
                 durability=DurabilityPolicy.VOLATILE,
             )
-            subscription = node.create_subscription(
+            subscription = self._node.create_subscription(
                 sensor_msgs.msg.Image,
                 topic,
                 lambda msg, _key=key: self._on_image(_key, msg),
                 qos,
             )
             self._subscriptions.append(subscription)
+            self._subscribed_keys.add(key)
             carb.log_warn(
                 f'[run_isaacsim] Camera TF image echo subscribed topic={topic} key={key} '
                 'stamp_source=image.header.stamp'
@@ -1624,6 +1633,7 @@ def main(args=None):
         while simulation_app.is_running():
             stepped_this_iteration: bool = False
             _spin_controller_callbacks(rclpy_spin_timeout_sec)
+            camera_tf_image_echo.sync()
             rclpy.spin_once(raycast_pub, timeout_sec=0)
             if controller.running:
                 if not was_playing:
