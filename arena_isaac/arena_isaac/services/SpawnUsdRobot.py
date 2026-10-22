@@ -1108,24 +1108,27 @@ def _setup_vln_camera_publishers(prim_path: str, namespace: str, base_frame: str
                         for writer in depth_writers
                     ],
                 )
-        if manual_publishers_enabled(backend):
-            # DEPRECATED manual image writer registration.  It is reachable
-            # only through explicit exclusive manual selection; native is the
-            # project default and never registers this publisher spec.
-            _register_vln_camera_publish_spec(
-                key=key,
-                camera_prim_path=camera_prim_path,
-                namespace=namespace,
-                camera_topic=camera_topic,
-                rgb_topic_name=rgb_topic_name,
-                frame=frame,
-                resolution=resolution,
-                publish_depth=publish_depth,
-                robot_prim_path=prim_path,
-                base_prim_path=base_prim_path,
-                base_frame=base_frame_id,
-                parent_frame=parent_frame,
-            )
+        # Always register the image topic metadata, including for the native
+        # backend.  DEPRECATED manual image writer registration is unchanged:
+        # manual writers still exist only under manual_publishers_enabled and
+        # are never created beside the native backend.  The metadata itself is
+        # backend-independent; the native camera TF image echo uses it to
+        # subscribe to the real RGB topic and stamp TF with the exact image
+        # header stamp.
+        _register_vln_camera_publish_spec(
+            key=key,
+            camera_prim_path=camera_prim_path,
+            namespace=namespace,
+            camera_topic=camera_topic,
+            rgb_topic_name=rgb_topic_name,
+            frame=frame,
+            resolution=resolution,
+            publish_depth=publish_depth,
+            robot_prim_path=prim_path,
+            base_prim_path=base_prim_path,
+            base_frame=base_frame_id,
+            parent_frame=parent_frame,
+        )
         carb.log_warn(
             f'[SpawnUsdRobot] Camera backend={backend} prim={camera_prim_path} '
             f'topic=/{namespace}/{camera_topic}/* frame={frame}'

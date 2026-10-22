@@ -187,7 +187,7 @@ from isaac_utils.managers.elevator_manager import elevator_manager
 #Import services
 from arena_isaac.services import services
 from pedestrian.simulator.logic.people_manager import PeopleManager
-from rclpy.qos import QoSProfile
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from arena_isaac import run_after_tick_queue
 import traceback
 try:
@@ -563,12 +563,26 @@ class DynamicCameraTfPublisher:
         return stamp
 
     def publish(self, sim_time: float) -> int:
+        stamp = self._stamp(max(sim_time, 0.0))
+        return self.publish_at_stamp(stamp)
+
+    def publish_at_stamp(self, stamp, key: str | None = None) -> int:
+        """Publish base-to-camera optical TF at an externally supplied stamp.
+
+        ``key`` restricts the publish to one camera runtime record.  The image
+        echo path uses this so the TF sample carries the *exact* header stamp of
+        the native image frame it belongs to.  The camera prim is a descendant
+        of the robot root while the base prim is a named link of the same robot,
+        so the relative optical transform is time-invariant for a rigidly
+        mounted sensor; only the stamp is echoed, never a nearest time.
+        """
         from arena_isaac.services.SpawnUsdRobot import get_vln_camera_tf_specs
 
         stage = omni.usd.get_context().get_stage()
-        stamp = self._stamp(max(sim_time, 0.0))
         transforms = []
         for spec in get_vln_camera_tf_specs():
+            if key is not None and str(spec.get('key') or '') != key:
+                continue
             base_path = str(spec.get('base_prim_path') or '')
             camera_path = str(spec.get('camera_prim_path') or '')
             parent_frame = str(spec.get('parent_frame') or '')
@@ -600,6 +614,61 @@ class DynamicCameraTfPublisher:
         if transforms:
             self._publisher.publish(tf2_msgs.msg.TFMessage(transforms=transforms))
         return len(transforms)
+
+
+class CameraTfImageEcho:
+    """Stamp camera TF with the exact header stamp of each native image frame.
+
+    The native Replicator ROS2 image writer derives its header stamp from the
+    render pipeline's own clock, which is not bit-identical to the main-loop
+    ``SimulationContext.current_time`` used by DynamicCameraTfPublisher, and the
+    writer cadence (IsaacSimulationGate) differs from the main-loop render
+    cadence.  An exact-time tf2 lookup therefore cannot rely on the main-loop
+    TF sample.  This echo subscribes to the native RGB stream and republishes
+    the same base-to-camera optical transform using the image's own header
+    stamp, which makes exact-stamp lookup possible without nearest-match,
+    without widening any time window, and without changing the scientific gate.
+    """
+
+    def __init__(self, node: rclpy.node.Node, tf_publisher: 'DynamicCameraTfPublisher'):
+        self._node = node
+        self._tf_publisher = tf_publisher
+        self._subscriptions = []
+        try:
+            from arena_isaac.services.SpawnUsdRobot import get_vln_camera_publish_specs
+        except Exception as exc:
+            carb.log_warn(f'[run_isaacsim] Camera TF image echo unavailable: {exc}')
+            return
+        for spec in get_vln_camera_publish_specs():
+            key = str(spec.get('key') or '')
+            topic_base = str(spec.get('topic_base') or '')
+            rgb_name = str(spec.get('rgb_topic_name') or 'image').strip('/')
+            if not key or not topic_base or not rgb_name:
+                continue
+            topic = f"{topic_base.rstrip('/')}/{rgb_name}"
+            qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+            subscription = node.create_subscription(
+                sensor_msgs.msg.Image,
+                topic,
+                lambda msg, _key=key: self._on_image(_key, msg),
+                qos,
+            )
+            self._subscriptions.append(subscription)
+            carb.log_warn(
+                f'[run_isaacsim] Camera TF image echo subscribed topic={topic} key={key} '
+                'stamp_source=image.header.stamp'
+            )
+
+    def _on_image(self, key: str, msg) -> None:
+        try:
+            self._tf_publisher.publish_at_stamp(msg.header.stamp, key=key)
+        except Exception as exc:
+            carb.log_warn(f'[run_isaacsim] Camera TF image echo failed key={key}: {exc}')
+
 
 
 class ManualReplicatorCameraPublisher:
@@ -1295,6 +1364,10 @@ def main(args=None):
         + json.dumps(camera_backend_session.manifest(), sort_keys=True)
     )
     dynamic_camera_tf_pub = DynamicCameraTfPublisher(controller)
+    # Native images carry a render-pipeline stamp that is not bit-identical to
+    # the main-loop sim time; echo the same optical transform at the image's own
+    # header stamp so exact-time tf2 lookups succeed.
+    camera_tf_image_echo = CameraTfImageEcho(controller, dynamic_camera_tf_pub)
     manual_camera_pub = (
         # DEPRECATED image path: default native does not instantiate this
         # class. Explicit manual remains diagnostic/legacy and exclusive.
@@ -1492,6 +1565,20 @@ def main(args=None):
         int(os.environ.get('ARENA_ISAAC_RENDER_EVERY_N_STEPS', '6' if str(os.environ.get('ARENA_ISAAC_HEADLESS', '0')).strip().lower() in {'1', 'true', 'yes', 'on'} else '1')),
         1,
     )
+    ros_callbacks_per_iteration = max(
+        int(os.environ.get('ARENA_ISAAC_ROS_CALLBACKS_PER_ITERATION', '32')),
+        1,
+    )
+    carb.log_warn(
+        '[run_isaacsim] ROS callback drain enabled: '
+        f'max_callbacks_per_iteration={ros_callbacks_per_iteration}'
+    )
+
+    def _spin_controller_callbacks(first_timeout_sec: float) -> None:
+        """Bound callback work while preventing subscriptions from starving services."""
+        rclpy.spin_once(controller, timeout_sec=first_timeout_sec)
+        for _ in range(ros_callbacks_per_iteration - 1):
+            rclpy.spin_once(controller, timeout_sec=0)
     # Do not force the very first post-unpause step to render in headless eval.
     # GRScenes + multiple Replicator render products can spend several minutes
     # compiling RTX/material state on that first rendered step.  If it happens
@@ -1536,7 +1623,7 @@ def main(args=None):
     try:
         while simulation_app.is_running():
             stepped_this_iteration: bool = False
-            rclpy.spin_once(controller, timeout_sec=rclpy_spin_timeout_sec)
+            _spin_controller_callbacks(rclpy_spin_timeout_sec)
             rclpy.spin_once(raycast_pub, timeout_sec=0)
             if controller.running:
                 if not was_playing:
@@ -1546,7 +1633,7 @@ def main(args=None):
                             '[run_isaacsim] Simulation unpaused; deferring play/step by one main-loop turn '
                             'so the ROS service response can flush before any expensive render work'
                         )
-                        rclpy.spin_once(controller, timeout_sec=0)
+                        _spin_controller_callbacks(0)
                         continue
 
                     if pre_play_render_warmup_frames > 0:

@@ -20,15 +20,27 @@ def test_spawn_registers_tf_for_native_and_manual_before_image_branch():
     source = SPAWN.read_text(encoding="utf-8")
     register = source.index("_register_vln_camera_tf_spec(", source.index("def configure_camera"))
     native = source.index("if spawnusdrobot_publishers_enabled(backend):", register)
-    manual = source.index("if manual_publishers_enabled(backend):", native)
-    assert register < native < manual
+    image_spec = source.index("_register_vln_camera_publish_spec(", native)
+    assert register < native < image_spec
     assert "Dynamic camera TF cannot resolve base prim" in source
 
 
-def test_manual_registration_is_deprecated_and_native_is_not_dual():
+def test_image_spec_registration_is_backend_independent_metadata():
+    source = SPAWN.read_text(encoding="utf-8")
+    start = source.index("_register_vln_camera_publish_spec(", source.index("def configure_camera"))
+    # Registration must not be gated on the deprecated manual backend: the
+    # native camera TF image echo reads the same topic metadata.
+    preceding = source[:start]
+    last_gate = preceding.rfind("if manual_publishers_enabled(backend):")
+    last_native = preceding.rfind("if spawnusdrobot_publishers_enabled(backend):")
+    assert last_gate < last_native
+    assert "native camera TF image echo" in source
+
+
+def test_manual_writers_remain_deprecated_and_native_is_not_dual():
     source = SPAWN.read_text(encoding="utf-8")
     assert "DEPRECATED manual image writer registration" in source
-    assert "native is the" in source
+    assert "never created beside the native backend" in source
 
 
 def test_same_robot_replacement_cleans_camera_runtime_before_prim_reuse():
