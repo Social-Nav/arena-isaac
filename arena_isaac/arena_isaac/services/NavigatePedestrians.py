@@ -9,12 +9,9 @@ from isaacsim_msgs.srv import NavigatePedestrians
 
 from .utils import Service, on_exception
 
-_LOOK_AHEAD_M = 2.0
+_DEFAULT_LOOK_AHEAD_M = 2.0
+_MIN_LOOK_AHEAD_M = 0.35
 _MIN_WALK_SPEED = 0.05   # below this hunav speed the agent counts as standing still
-# Planar gap past which the character walks even when hunav reports no motion, to correct
-# drift. Must exceed Person.update()'s 0.3 m pop-threshold.
-_CATCHUP_M = 0.4
-_CATCHUP_SPEED = 0.5
 
 @on_exception(False)
 def navigate_pedestrian(goal: PedestrianGoal) -> bool:
@@ -33,24 +30,27 @@ def navigate_pedestrian(goal: PedestrianGoal) -> bool:
     )
     dist = float(np.linalg.norm(direction))
 
-    # Idle on what hunav REPORTS, not on proximity. The old `dist < 0.01` was finer than
-    # the 1 cm rounding hunav applies to the pose it sends, so quantisation noise read as
-    # "arrived" and froze the character mid-route while /people kept moving in RViz.
+    # HuNav reports zero speed after a non-cyclic agent consumes its final goal. Stop the
+    # rendered character immediately as well: a distance-based catch-up here would keep the
+    # character walking after the logical agent had already reached the end of its route.
     speed = float(getattr(goal, 'velocity', 0.8))
-    if speed < _MIN_WALK_SPEED and dist < _CATCHUP_M:
+    if speed < _MIN_WALK_SPEED:
         person._target_positions.clear()
+        person._target_speed = 0.0
         return True
 
     if dist < 1e-6:
         return True   # no direction this cycle; leave the queue alone
 
-    if speed < _MIN_WALK_SPEED:
-        speed = _CATCHUP_SPEED   # catching up: Walk=0 would animate in place
-
-    # Project _LOOK_AHEAD_M ahead so the waypoint stays beyond Person.update()'s 0.3 m
+    # Project ahead so the waypoint stays beyond Person.update()'s 0.3 m
     # pop-threshold. direction has z=0, so the target keeps the character's own height.
+    configured_look_ahead = float(getattr(goal, 'look_ahead', _DEFAULT_LOOK_AHEAD_M))
+    look_ahead = max(
+        _MIN_LOOK_AHEAD_M,
+        configured_look_ahead if configured_look_ahead > 0.0 else _DEFAULT_LOOK_AHEAD_M,
+    )
     unit = direction / dist
-    far_target = current_pos + unit * _LOOK_AHEAD_M
+    far_target = current_pos + unit * look_ahead
 
     person._target_positions.clear()
     person.update_target_positions(

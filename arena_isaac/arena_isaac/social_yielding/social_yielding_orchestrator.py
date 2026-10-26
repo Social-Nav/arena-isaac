@@ -19,12 +19,14 @@ containers). Reprojection (pixel_to_map) is pure numpy; the selector is HTTP.
 
 import math
 import os
+import threading
 import time
 from pathlib import Path
 
 import yaml
 
 import rclpy
+from action_msgs.msg import GoalStatus, GoalStatusArray
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, DurabilityPolicy
@@ -35,6 +37,7 @@ from tf2_ros import TransformException
 
 from std_msgs.msg import String, Bool, Int16
 from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Path as NavPath
 from nav2_msgs.msg import Costmap, BehaviorTreeLog
 from nav2_msgs.action import ComputePathToPose
 from std_srvs.srv import Trigger
@@ -48,21 +51,25 @@ from arena_isaac.social_yielding.social_yielding_selector import select_yielding
 ROBOT = os.environ.get("ARENA_ROBOT", "").strip() or "Ai2_Bot2"
 NS = f"/task_generator_node/{ROBOT}"
 GOAL_TOPIC = f"{NS}/goal_pose"
+NAV_STATUS_TOPIC = f"{NS}/navigate_to_pose/_action/status"
+PLAN_TOPIC = f"{NS}/plan"
 COSTMAP_TOPIC = f"{NS}/global_costmap/costmap_raw"   # nav2_msgs/Costmap, raw 0-255
 COMPUTE_PATH_ACTION = f"{NS}/compute_path_to_pose"
+PREPARE_ORIGINAL_GOAL_RESUME_SRV = f"{NS}/prepare_original_goal_resume"
 SNAPSHOT_READY_TOPIC = "isaac/snapshot_ready"
 UNPAUSE_SRV = "isaac/UnpauseSimulation"
 PAUSE_SRV = "isaac/PauseSimulation"
 CAPTURE_SRV = "isaac/CaptureSnapshot"
+RELEASE_MOTION_HOLD_SRV = "/social_yielding/release_motion_hold"
 BASE_FRAME = f"{ROBOT}/base_link"
 
 
 # --- Yield-recovery loop (drive to yield goal Y -> can we get back to the pre-yield spot A?
 #     yes:行人让开了, resume original goal G. no: re-yield from here.) ---
 ARRIVE_TOL = 0.5           # m — robot within this of yield goal Y counts as "arrived" (TF map dist)
-ARRIVE_TIMEOUT = 90.0      # s — give up waiting to reach Y (wall clock; probe already bails on pause).
-                           # 40->90: robot was moving toward Y (dist shrinking) but slowly, so give
-                           # it more time to actually arrive before declaring failure.
+ARRIVE_TIMEOUT = 240.0     # s — give up waiting to reach Y (wall clock; probe already bails on pause).
+                           # Long yielding maneuvers can make progress slowly; allow four minutes
+                           # before declaring failure and restoring the original goal.
 MAX_YIELD_ROUNDS = 5       # safety valve: after this many consecutive yields, force-resume G and stop
 # Topic (latched) telling the proactive trigger a yield episode is in progress, so it does NOT
 # fire another yield mid-episode (incl. while re-yielding). Published by orchestrator.
@@ -89,6 +96,17 @@ SAVE_SNAPSHOTS = os.environ.get("ARENA_SAVE_SNAPSHOTS", "false").strip().lower()
 # can't reach anyway (on/inside an obstacle, e.g. selected "on a wall").
 GOAL_COST_THRESHOLD = 253
 MAX_GOAL_ATTEMPTS = 6   # selector regenerations before giving up
+# NavFn is configured with tolerance=1.0 m and searches a neighborhood around the requested
+# target. Keep generated Y goals that far inside the live global costmap so the search itself
+# cannot step beyond the map boundary (the failure otherwise appears as worldToMap failed).
+GOAL_EDGE_MARGIN = 1.0
+# Keep physical motion blocked until Nav2 has replaced G with a planner path to Y.
+# NavFn may terminate within its configured 1.0 m tolerance, so endpoint matching needs
+# the same allowance. The extra settle window lets the 10 Hz controller and 20 Hz
+# OPEN_LOOP velocity smoother consume the new direction while their output is still gated.
+Y_PLAN_ENDPOINT_TOLERANCE = 1.1
+Y_PLAN_TIMEOUT = 8.0
+Y_COMMAND_SETTLE_SECONDS = 0.35
 
 
 class SocialReplanOrchestrator(Node):
@@ -96,11 +114,24 @@ class SocialReplanOrchestrator(Node):
         super().__init__("social_yielding_orchestrator")
 
         self._busy = False  # guard against overlapping replans
+        self._episode_generation = 0
+        self._busy_generation = None
+        self._plan_condition = threading.Condition()
+        self._latest_plan: NavPath | None = None
+        self._plan_sequence = 0
 
         self.create_subscription(
             String, SNAPSHOT_READY_TOPIC, self._cb_snapshot_ready, 10)
         self._goal_pub = self.create_publisher(PoseStamped, GOAL_TOPIC, 10)
+        self._prepare_original_goal_resume = self.create_client(
+            Trigger, PREPARE_ORIGINAL_GOAL_RESUME_SRV)
         self._unpause = self.create_client(Trigger, UNPAUSE_SRV)
+        self._release_motion_hold = self.create_client(Trigger, RELEASE_MOTION_HOLD_SRV)
+        self._nav_statuses = {}
+        self._yield_goal_id_baseline = set()
+        self.create_subscription(
+            GoalStatusArray, NAV_STATUS_TOPIC, self._cb_nav_status, 10)
+        self.create_subscription(NavPath, PLAN_TOPIC, self._cb_plan, 10)
 
         # NOTE: the cmd_vel_nav / cmd_vel / odom / received_global_plan taps that used to live
         # here were removed. They only ever fed per-sample log lines, and that job now belongs
@@ -165,7 +196,7 @@ class SocialReplanOrchestrator(Node):
         # social_yielding/active latched True, which makes the proactive trigger skip every
         # future episode ("orchestrator owns control") and the pipeline never fires again.
         self.create_subscription(
-            Int16, "/task_generator_node/task_reset", self._cb_task_reset, 10)
+            Int16, "/task_generator_node/task_reset", self._cb_task_reset, _state_qos)
 
         self.get_logger().info(
             f"SocialReplanOrchestrator ready | robot={ROBOT} | listening {SNAPSHOT_READY_TOPIC} "
@@ -174,15 +205,22 @@ class SocialReplanOrchestrator(Node):
     def _cb_task_reset(self, msg: Int16):
         """Abandon the current yield episode; the new task owns the robot now."""
         was_active = self._yield_active or self._busy
+        # Invalidate a selector HTTP request that may still be blocking in an old thread.
+        # It cannot be canceled inside requests.post(), but every state-changing boundary
+        # checks this generation when the call returns.
+        self._episode_generation += 1
         # Supersede any running probe / arrival wait so _drive_and_wait_arrival returns
         # False promptly instead of chasing the previous episode's Y.
         self._probe_epoch += 1
         self._yield_active = False
         self._busy = False
+        self._busy_generation = None
         self._pos_A = None
         self._orig_goal_G = None
         self._yield_round = 0
         self._pending_reyield = False
+        self._nav_statuses.clear()
+        self._yield_goal_id_baseline.clear()
         self._publish_active(False)   # re-arm the proactive trigger for the new episode
         if was_active:
             self.get_logger().warn(
@@ -190,6 +228,67 @@ class SocialReplanOrchestrator(Node):
                 f"state cleared, trigger re-armed")
         else:
             self.get_logger().debug(f"[Reset] task_reset #{msg.data} -> state cleared")
+
+    def _cb_nav_status(self, msg: GoalStatusArray):
+        self._nav_statuses = {
+            bytes(status.goal_info.goal_id.uuid): status.status
+            for status in msg.status_list
+        }
+
+    def _cb_plan(self, msg: NavPath):
+        if not msg.poses:
+            return
+        with self._plan_condition:
+            self._latest_plan = msg
+            self._plan_sequence += 1
+            self._plan_condition.notify_all()
+
+    def _wait_for_y_plan(
+        self,
+        goal: PoseStamped,
+        generation: int,
+        baseline_sequence: int,
+        timeout: float = Y_PLAN_TIMEOUT,
+    ) -> bool:
+        """Wait for a path received after Y whose endpoint corresponds to Y.
+
+        Callback sequence is intentional: this node normally runs on wall time while Nav2
+        stamps planner paths with Isaac /clock, so comparing their header stamps can reject
+        every valid Y path. Clearing the cached path and recording the receive sequence at
+        the publication boundary gives an unambiguous local ordering without mixing clocks.
+        """
+        deadline = time.monotonic() + timeout
+        last_rejection = "no plan received after Y"
+        while self._generation_current(generation):
+            with self._plan_condition:
+                plan = self._latest_plan
+                if (
+                    self._plan_sequence > baseline_sequence
+                    and plan is not None
+                    and plan.poses
+                ):
+                    end = plan.poses[-1].pose.position
+                    target = goal.pose.position
+                    same_frame = plan.header.frame_id == goal.header.frame_id
+                    endpoint_error = math.hypot(end.x - target.x, end.y - target.y)
+                    endpoint_ok = endpoint_error <= Y_PLAN_ENDPOINT_TOLERANCE
+                    if same_frame and endpoint_ok:
+                        self.get_logger().info(
+                            f"[Replan] fresh Y plan accepted: {len(plan.poses)} poses, "
+                            f"endpoint error={endpoint_error:.2f}m")
+                        return True
+                    last_rejection = (
+                        f"frame={plan.header.frame_id!r} (expected {goal.header.frame_id!r}), "
+                        f"endpoint=({end.x:.2f},{end.y:.2f}), "
+                        f"Y=({target.x:.2f},{target.y:.2f}), error={endpoint_error:.2f}m"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    self.get_logger().error(
+                        f"[Replan] Y plan identification timed out: {last_rejection}")
+                    return False
+                self._plan_condition.wait(timeout=min(0.1, remaining))
+        return False
 
     def _cb_snapshot_ready(self, msg: String):
         snapshot_dir = msg.data.strip()
@@ -201,12 +300,16 @@ class SocialReplanOrchestrator(Node):
         if self._busy:
             self.get_logger().warn(f"[Replan] busy, ignoring: {snapshot_dir}")
             return
+        generation = self._episode_generation
         self._busy = True
+        self._busy_generation = generation
         self._probe_epoch += 1   # supersede any still-running continuous probe from a prior replan
         # Do the (blocking: HTTP + numpy) work off the executor thread.
-        import threading
-        threading.Thread(target=self._run_replan, args=(snapshot_dir,),
+        threading.Thread(target=self._run_replan, args=(snapshot_dir, generation),
                          daemon=True).start()
+
+    def _generation_current(self, generation: int) -> bool:
+        return generation == self._episode_generation
 
     # BT nodes that mean "a recovery is driving" vs "normal path following".
     _RECOVERY_NODES = ("BackUp", "Spin", "Wait", "DriveOnHeading", "AssistedTeleop",
@@ -244,10 +347,20 @@ class SocialReplanOrchestrator(Node):
         oy = cm.metadata.origin.position.y
         sx = cm.metadata.size_x
         sy = cm.metadata.size_y
-        col = int((mx - ox) / res)
-        row = int((my - oy) / res)
+        col_float = (mx - ox) / res
+        row_float = (my - oy) / res
+        col = int(col_float)
+        row = int(row_float)
         if not (0 <= col < sx and 0 <= row < sy):
             return None  # outside costmap bounds
+        margin_cells = math.ceil(GOAL_EDGE_MARGIN / res)
+        if (
+            col < margin_cells
+            or row < margin_cells
+            or col >= sx - margin_cells
+            or row >= sy - margin_cells
+        ):
+            return None  # too close to the edge for NavFn's tolerance search
         return int(cm.data[row * sx + col])
 
     # ── yield-recovery helpers ─────────────────────────────────────────────────
@@ -388,8 +501,10 @@ class SocialReplanOrchestrator(Node):
         r = fut.result()
         return bool(r is not None and r.success)
 
-    def _run_replan(self, snapshot_dir: str):
+    def _run_replan(self, snapshot_dir: str, generation: int):
         try:
+            if not self._generation_current(generation):
+                return
             self.get_logger().info(f"[Replan] step 1/4: snapshot={snapshot_dir}")
             d = Path(snapshot_dir)
             if not d.is_dir():
@@ -419,10 +534,18 @@ class SocialReplanOrchestrator(Node):
             mx = my = None
             rejected: list = []
             for attempt in range(1, MAX_GOAL_ATTEMPTS + 1):
+                if not self._generation_current(generation):
+                    self.get_logger().info(
+                        "[Replan] reset superseded this selector loop; abandoning old episode")
+                    return
                 self.get_logger().info(
                     f"[Replan] step 2/4: yielding selector (GPT) attempt {attempt}/{MAX_GOAL_ATTEMPTS}"
                     f"{f' (avoiding {len(rejected)} rejected)' if rejected else ''}...")
                 sel = select_yielding_goal(str(d), rejected=rejected)
+                if not self._generation_current(generation):
+                    self.get_logger().info(
+                        "[Replan] selector returned after reset; discarding old response")
+                    return
                 if not sel or "camera" not in sel or "pixel_goal" not in sel:
                     self.get_logger().warn(f"[Replan]   attempt {attempt}: selector returned no valid goal")
                     continue
@@ -453,7 +576,10 @@ class SocialReplanOrchestrator(Node):
                 if cost is None:
                     self.get_logger().warn(
                         f"[Replan]   attempt {attempt}: goal ({cx:.2f},{cy:.2f}) has no costmap "
-                        f"reading (costmap missing or out of bounds); accepting cautiously")
+                        f"reading (costmap missing or out of bounds) -> regenerating")
+                    rejected.append({"camera": cam, "pixel": [u, v],
+                                     "reason": "outside the current global costmap"})
+                    continue
                 elif cost >= GOAL_COST_THRESHOLD:
                     self.get_logger().warn(
                         f"[Replan]   attempt {attempt}: REJECTED goal ({cx:.2f},{cy:.2f}) "
@@ -483,22 +609,51 @@ class SocialReplanOrchestrator(Node):
             goal.pose.position.z = 0.0
             goal.pose.orientation.w = 1.0  # yaw left to the planner
 
-            # 4. UNPAUSE, then IMMEDIATELY publish the new goal — do NOT wait.
+            # 4. UNPAUSE and publish Y, but retain motion hold until the new plan and
+            #    command pipeline have replaced every residual command for original G.
             #    Timing subtlety learned from logs:
             #    - If we publish while frozen, bt_navigator plans on a stale costmap -> fails.
             #    - If we unpause and WAIT before publishing, nav2 resumes chasing the OLD goal
             #      (the corridor-end goal), which is currently unreachable -> BT enters BackUp,
             #      an uninterruptible recovery that then blocks our new goal for ~35s.
             #    So: unpause, then publish the new goal AS FAST AS POSSIBLE so it preempts the
-            #    old NavigateToPose action before a recovery can latch. bt_navigator's
-            #    onGoalPoseReceived preempts whatever is running with the new goal.
+            #    old NavigateToPose action before a recovery can latch. The separate motion
+            #    hold remains closed through both operations, so neither the robot nor HuNav
+            #    can move in this hand-off window. Release only after Y is on goal_pose.
+            if not self._generation_current(generation):
+                return
             if not self._call_unpause(timeout=2.0):
                 self.get_logger().error("[Replan] unpause failed; goal NOT sent, sim still paused")
                 return
+            self._yield_goal_id_baseline = set(self._nav_statuses)
             goal.header.stamp = self.get_clock().now().to_msg()
+            with self._plan_condition:
+                self._latest_plan = None
+                plan_baseline = self._plan_sequence
             self._goal_pub.publish(goal)
+            self.get_logger().info(
+                "[Replan] step 4/4: Y published; holding motion until its fresh plan arrives")
+            if not self._wait_for_y_plan(goal, generation, plan_baseline):
+                self.get_logger().error(
+                    f"[Replan] no fresh plan to Y within {Y_PLAN_TIMEOUT:.1f}s; "
+                    "motion hold remains active")
+                return
+            # The planner path precedes controller setPlan/computeVelocityCommands. Keep the
+            # gate closed for several controller/smoother cycles so OPEN_LOOP state cannot
+            # leak the old G-directed linear command when the gate opens.
+            settle_deadline = time.monotonic() + Y_COMMAND_SETTLE_SECONDS
+            while time.monotonic() < settle_deadline:
+                if not self._generation_current(generation):
+                    return
+                time.sleep(0.02)
+            if not self._call_trigger(self._release_motion_hold, "release motion hold", 2.0):
+                self.get_logger().error(
+                    "[Replan] yielding goal published but motion hold release failed; "
+                    "robot and pedestrians remain frozen")
+                return
             self.get_logger().warn(
-                "[Replan] step 4/4: UNPAUSED + yielding goal published immediately (preempts old goal)")
+                "[Replan] step 4/4: fresh Y plan active + command pipeline settled + "
+                "motion hold released")
 
             # 5. drive to Y and wait for arrival (TF map distance). No en-route checking.
             if not self._drive_and_wait_arrival(goal):
@@ -531,7 +686,10 @@ class SocialReplanOrchestrator(Node):
             import traceback
             traceback.print_exc()
         finally:
-            self._busy = False
+            owns_current_replan = self._busy_generation == generation
+            if owns_current_replan:
+                self._busy = False
+                self._busy_generation = None
             # Snapshot retention. Safe here and only here: every reader of the dir
             # (selector, pixel_to_map) ran inside the try above, so by now it is dead
             # weight. Deleting it earlier would break the re-yield path, which needs a
@@ -539,7 +697,7 @@ class SocialReplanOrchestrator(Node):
             self._discard_snapshot(snapshot_dir)
             # If A was still blocked, trigger the next yield now that _busy is clear
             # (pause+capture -> Isaac publishes snapshot_ready -> _cb_snapshot_ready re-enters).
-            if self._pending_reyield:
+            if owns_current_replan and self._pending_reyield:
                 self._pending_reyield = False
                 self._request_pause_and_capture()
 
@@ -586,6 +744,28 @@ class SocialReplanOrchestrator(Node):
         tf_failures = 0
         while my_epoch == self._probe_epoch and self._sim_running:
             time.sleep(ARRIVE_SAMPLE)
+            yield_actions = [
+                (goal_id, status)
+                for goal_id, status in self._nav_statuses.items()
+                if goal_id not in self._yield_goal_id_baseline
+            ]
+            failed_action = next(
+                (
+                    (goal_id, status)
+                    for goal_id, status in yield_actions
+                    if status in (
+                        GoalStatus.STATUS_ABORTED,
+                        GoalStatus.STATUS_CANCELED,
+                    )
+                ),
+                None,
+            )
+            if failed_action is not None:
+                goal_id, status = failed_action
+                self.get_logger().error(
+                    f"[Yield] Y navigation ended with status {status} "
+                    f"(UUID={goal_id.hex()[:8]}); restoring original goal G")
+                return False
             if time.monotonic() - start > ARRIVE_TIMEOUT:
                 # Timeout is the decisive moment, so make this line carry everything: how far
                 # we still are, how much ground we actually covered, and WHO was driving
@@ -642,6 +822,11 @@ class SocialReplanOrchestrator(Node):
     def _resume_original_goal(self):
         """End the yield episode: publish original goal G (if known) and reset state."""
         if self._orig_goal_G is not None:
+            prepared = self._call_resume_prepare(timeout=2.0)
+            if not prepared:
+                self.get_logger().error(
+                    "[Resume] RobotManager resume handshake failed; publishing G with "
+                    "fallback UUID association")
             g = self._orig_goal_G
             g.header.stamp = self.get_clock().now().to_msg()
             self._goal_pub.publish(g)
@@ -654,6 +839,23 @@ class SocialReplanOrchestrator(Node):
         self._pos_A = None
         self._yield_round = 0
         self._publish_active(False)   # episode over -> proactive trigger may fire again
+
+    def _call_resume_prepare(self, timeout: float) -> bool:
+        """Synchronize RobotManager's action-UUID boundary before publishing original G."""
+        client = self._prepare_original_goal_resume
+        if not client.service_is_ready() and not client.wait_for_service(timeout_sec=timeout):
+            self.get_logger().warn(
+                f"[Resume] service unavailable: {PREPARE_ORIGINAL_GOAL_RESUME_SRV}")
+            return False
+        future = client.call_async(Trigger.Request())
+        deadline = time.monotonic() + timeout
+        while not future.done():
+            if time.monotonic() > deadline:
+                self.get_logger().warn("[Resume] RobotManager prepare handshake timed out")
+                return False
+            time.sleep(0.02)
+        response = future.result()
+        return bool(response is not None and response.success)
 
     def _publish_active(self, active: bool):
         """Latched flag: True for the whole yield episode (incl. re-yields) so the proactive

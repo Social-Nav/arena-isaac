@@ -158,11 +158,12 @@ import action_msgs.msg
 from isaac_utils.graphs.time import PublishTime
 from isaac_utils.managers.door_manager import DoorManager
 from isaac_utils.managers.elevator_manager import elevator_manager
+from arena_isaac.scene_readiness import SceneReadinessCoordinator
 
 #Import services
 from arena_isaac.services import services
 from pedestrian.simulator.logic.people_manager import PeopleManager
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from arena_isaac import run_after_tick_queue
 import traceback
 try:
@@ -236,14 +237,16 @@ class RaycastObstaclePublisher(rclpy.node.Node):
     and publishes obstacle hits to hunav.py's _obstacle_subscriber.
 
     Mirrors hunav_isaac_wrapper's get_closest_obstacles() approach:
-      - 36 rays covering 360° (wrapper uses 90; 36 balances accuracy/perf)
-      - 4 sensor heights to catch low/mid/high wall geometry
+      - 72 rays covering 360° (5° spacing, reducing thin-obstacle blind sectors)
+      - 9 absolute heights above the ground to cover the requested 0.05-2.00 m range
       - uses hit['position'] directly (exact world-space hit point)
     """
 
-    NUM_RAYS = 36
-    RAY_DISTANCE = 4.0
-    SENSOR_HEIGHTS = [0.1, 0.25, 0.5, 1.0]
+    NUM_RAYS = 72
+    RAY_DISTANCE = 4.5
+    SENSOR_HEIGHTS_ABOVE_GROUND = [
+        0.05, 0.15, 0.35, 0.60, 0.90, 1.20, 1.50, 1.80, 2.00
+    ]
 
     def __init__(self, peds_topic: str, obstacles_topic: str):
         super().__init__(node_name='raycast_obstacle_publisher')
@@ -270,7 +273,6 @@ class RaycastObstaclePublisher(rclpy.node.Node):
 
             ox = ped.pose.position.x
             oy = ped.pose.position.y
-            oz = ped.pose.position.z  
 
             for i in range(self.NUM_RAYS):
                 angle = angle_step * i
@@ -281,9 +283,13 @@ class RaycastObstaclePublisher(rclpy.node.Node):
                 best_pos = None
 
                 # Cast at each sensor height; keep the closest hit
-                for h in self.SENSOR_HEIGHTS:
+                # arena_peds pose.z is the character asset's spawn offset (currently
+                # 1.25 m), not ground elevation. GRScenes use z=0 as the floor, so cast
+                # at explicit heights above that floor instead of adding pose.z twice.
+                ground_z = 0.0
+                for h in self.SENSOR_HEIGHTS_ABOVE_GROUND:
                     hit = self._physx_query.raycast_closest(
-                        carb.Float3(ox, oy, oz + h),
+                        carb.Float3(ox, oy, ground_z + h),
                         carb.Float3(dx, dy, 0.0),
                         self.RAY_DISTANCE
                     )
@@ -342,7 +348,6 @@ class IsaacController(rclpy.node.Node):
 
         # Publish sim running state (latched) so external nodes — e.g. the
         # proactive-yielding trigger — can react to pause/unpause transitions.
-        from rclpy.qos import QoSProfile, DurabilityPolicy
         _state_qos = QoSProfile(depth=1)
         _state_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.__running_pub = self.create_publisher(
@@ -354,6 +359,13 @@ class IsaacController(rclpy.node.Node):
         self.__snapshot_ready_pub = self.create_publisher(
             std_msgs.msg.String, 'isaac/snapshot_ready', 10)
 
+        # Episode id that is safe for robot and pedestrian goals to start. -1 means the
+        # current reset is still spawning or settling. TRANSIENT_LOCAL prevents a late
+        # subscriber from mistaking an old episode for the current one.
+        self.__scene_ready_pub = self.create_publisher(
+            std_msgs.msg.Int16, 'isaac/scene_ready', _state_qos)
+        self.publish_scene_ready(-1)
+
     def _publish_running_state(self):
         try:
             self.__running_pub.publish(std_msgs.msg.Bool(data=bool(self._running)))
@@ -364,6 +376,12 @@ class IsaacController(rclpy.node.Node):
         try:
             self.__snapshot_ready_pub.publish(std_msgs.msg.String(data=str(out_dir)))
             self.get_logger().info(f"Published snapshot_ready: {out_dir}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def publish_scene_ready(self, episode: int):
+        try:
+            self.__scene_ready_pub.publish(std_msgs.msg.Int16(data=int(episode)))
         except Exception:  # noqa: BLE001
             pass
 
@@ -661,18 +679,29 @@ def main(args=None):
     rclpy.init()
     controller = IsaacController()
 
+    scene_readiness = SceneReadinessCoordinator(
+        people=lambda: (
+            person
+            for person in PeopleManager.get_people_manager().people.values()
+            if is_prim_path_valid(person.path)
+        ),
+        publish=controller.publish_scene_ready,
+        settle_sim_seconds=0.75,
+    )
+
     # Subscribe to task lifecycle events to control when data collection happens
     def _on_task_reset(msg: std_msgs.msg.Int16):
         """task_generator fires this after each reset — treat as episode START.
         If there is leftover data from an interrupted episode, save it first."""
         nonlocal collecting, frame_step_counter
+        scene_readiness.reset_completed(msg.data)
         if not enable_logging or logger is None:
             return
 
         episode_num = msg.data
 
         def _start_episode():
-            nonlocal collecting, frame_step_counter
+            nonlocal collecting, frame_step_counter, has_saved
             # Discard leftover buffer if robot was interrupted mid-task (no save signal received)
             if collecting or len(logger.param_buffer) > 0:
                 sys.stderr.write(f"[TaskReset #{episode_num}] Discarding incomplete episode ({len(logger.param_buffer)} frames)...\n")
@@ -683,21 +712,19 @@ def main(args=None):
             # Clear stale pedestrian prims — they are deleted/respawned on reset
             logger.pedestrian_prims = []
             frame_step_counter = 0
+            has_saved = False
             collecting = True
             sys.stderr.write(f"[TaskReset #{episode_num}] Episode started, collecting data.\n")
             sys.stderr.flush()
 
         run_after_tick_queue.put_nowait(_start_episode)
 
-    def _on_nav_status(msg: action_msgs.msg.GoalStatusArray):
-        """Nav2 action status — save on success, discard on abort/cancel."""
-        nonlocal collecting
+    def _on_route_status(msg: std_msgs.msg.Int8):
+        """Complete robot route status — save only after its final waypoint."""
+        nonlocal collecting, has_saved
         if not enable_logging or logger is None or not collecting:
             return
-        last = next(reversed(list(msg.status_list)), None)
-        if last is None:
-            return
-        status = last.status
+        status = msg.data
         terminal = frozenset({
             action_msgs.msg.GoalStatus.STATUS_SUCCEEDED,
             action_msgs.msg.GoalStatus.STATUS_ABORTED,
@@ -707,9 +734,11 @@ def main(args=None):
             return
         succeeded = status == action_msgs.msg.GoalStatus.STATUS_SUCCEEDED
         label = "SUCCEEDED" if succeeded else "ABORTED/CANCELED"
+        sys.stderr.write(f"[RouteStatus] received {status} ({label})\n")
+        sys.stderr.flush()
 
         def _end_episode():
-            nonlocal collecting
+            nonlocal collecting, has_saved
             collecting = False
             if not succeeded:
                 sys.stderr.write(f"[NavStatus {label}] Discarding episode...\n")
@@ -726,6 +755,7 @@ def main(args=None):
             try:
                 logger.save_episode()
                 logger.wait_for_pending_saves(timeout=120.0)
+                has_saved = True
                 sys.stderr.write(f"[NavStatus {label}] Save complete.\n")
                 _pub_episode_saved.publish(std_msgs.msg.Empty())
             except Exception as e:
@@ -756,11 +786,12 @@ def main(args=None):
         run_after_tick_queue.put_nowait(_save)
 
     controller.create_subscription(
-        std_msgs.msg.Int16, '/task_generator_node/task_reset', _on_task_reset, 10)
+        std_msgs.msg.Int16, '/task_generator_node/task_reset', _on_task_reset,
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
     controller.create_subscription(
-        action_msgs.msg.GoalStatusArray,
-        f'/task_generator_node/{robot_name}/navigate_to_pose/_action/status',
-        _on_nav_status, 1)
+        std_msgs.msg.Int8,
+        f'/task_generator_node/{robot_name}/route_status',
+        _on_route_status, 10)
     controller.create_subscription(
         std_msgs.msg.Empty, '/task_generator_node/finished', _on_finished, 10)
 
@@ -832,6 +863,10 @@ def main(args=None):
                 elevator_manager.update()
                 world.step(render=True)
                 stepped_this_iteration = True
+                if scene_readiness.update(SimulationContext.instance().current_time):
+                    controller.get_logger().info(
+                        "Scene ready: character graphs initialized and 0.75 s "
+                        "of simulation settling completed")
                 # Start data collection and saving
                 if enable_logging:
                     # Check every 50 frames whether the robot appears

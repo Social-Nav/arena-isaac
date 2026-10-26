@@ -30,9 +30,27 @@ import glob
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+def resolve_data_path(path):
+    """Resolve CLI paths from either the current directory or Arena workspace root."""
+    expanded = os.path.expanduser(path)
+    candidates = [os.path.abspath(expanded)]
+    if not os.path.isabs(expanded):
+        here = os.path.dirname(os.path.abspath(__file__))
+        arena_root = os.path.abspath(os.path.join(here, *([os.pardir] * 5)))
+        workspace_root = os.path.dirname(os.path.dirname(arena_root))
+        candidates.append(os.path.abspath(os.path.join(workspace_root, expanded)))
+
+    for candidate in dict.fromkeys(candidates):
+        if os.path.isdir(candidate):
+            return candidate
+    return None
 
 import imageio.v3 as iio
 import numpy as np
@@ -282,7 +300,48 @@ def write_preview(frames: np.ndarray, preview_dir: str, ep_id: int, kind: str, f
         )
     if frames.ndim == 3:  # grayscale → 3 channels
         frames = np.stack([frames] * 3, axis=-1)
-    iio.imwrite(path, frames, fps=fps, codec="libx264")
+    if frames.ndim != 4 or frames.shape[-1] not in (3, 4):
+        raise ValueError(f"preview frames must be NHWC RGB/RGBA, got {frames.shape}")
+    frames = np.ascontiguousarray(frames[..., :3])
+    height, width = frames.shape[1:3]
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError(
+            "ffmpeg is required to write preview MP4 files but was not found on PATH"
+        )
+
+    # yuv420p requires even dimensions. Padding one edge preserves all source pixels and
+    # avoids silently resizing the camera image.
+    pad_filter = f"pad=ceil(iw/2)*2:ceil(ih/2)*2"
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-s:v", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "-",
+        "-an",
+        "-vf", pad_filter,
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        path,
+    ]
+    result = subprocess.run(
+        command,
+        input=frames.tobytes(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg failed to write {path}: {error}")
 
 
 def intrinsics(width, height, hfov_deg):
@@ -1324,6 +1383,14 @@ def main():
     )
     p.add_argument("--workers", type=int, default=1, help="parallel workers (currently unused, TODO)")
     cfg = p.parse_args()
+
+    resolved_data_path = resolve_data_path(cfg.data_path)
+    if resolved_data_path is None:
+        p.error(
+            f"--data-path does not exist: {cfg.data_path!r}. "
+            "Use an absolute path, or a path relative to the current directory/workspace root."
+        )
+    cfg.data_path = resolved_data_path
 
     if cfg.max_goal_distance <= 0:
         p.error("--max-goal-distance must be greater than 0")

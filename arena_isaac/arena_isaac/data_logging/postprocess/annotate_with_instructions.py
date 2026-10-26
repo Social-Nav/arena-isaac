@@ -39,9 +39,10 @@ except ImportError:  # run as a plain script rather than a package module
 # VLM Configuration
 # ========================================
 
-MODEL = "gemini-2.5-pro"
-API_URL = f"https://jkwl.dmxapi.cn/v1beta/models/{MODEL}:generateContent"
-API_KEY = os.environ.get("API_KEY", "")
+MODEL = "gemini-3.1-pro-preview"
+DMX_BASE_URL = os.environ.get("DMX_BASE_URL", "https://llmapi.roboscience.xyz").rstrip("/")
+API_URL = f"{DMX_BASE_URL}/v1beta/models/{MODEL}:generateContent"
+API_KEY = os.environ.get("DMX_API_KEY", "") or os.environ.get("API_KEY", "")
 
 VLN_PROMPT = """
 You are an expert VLN dataset annotator familiar with the R2R (Room-to-Room) dataset format.
@@ -95,14 +96,19 @@ def call_gemini_api(
     video_data: str,
     mime_type: str,
     prompt: str,
-    max_retries: int = 3
+    max_retries: int = 3,
+    temperature: float = 0.2,
+    max_output_tokens: int = 2048,
 ) -> dict | None:
-    """Send video analysis request to DMXAPI Gemini endpoint."""
+    """Send video analysis request using Gemini's native generateContent format."""
     if not API_KEY:
         print("    ERROR: API_KEY not set. Export API_KEY=sk-... before running.")
         return None
 
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "x-goog-api-key": API_KEY,
+        "Content-Type": "application/json",
+    }
     payload = {
         "contents": [{
             "role": "user",
@@ -110,29 +116,24 @@ def call_gemini_api(
                 {
                     "inlineData": {
                         "mimeType": mime_type,
-                        "data": video_data
+                        "data": video_data,
                     }
                 },
-                {"text": prompt}
-            ]
+                {"text": prompt},
+            ],
         }],
         "generationConfig": {
-            "temperature": 0.2,
+            "temperature": temperature,
             "topP": 0.8,
-            "maxOutputTokens": 2048
-        }
+            "maxOutputTokens": max_output_tokens,
+            "responseMimeType": "application/json",
+        },
     }
 
     for attempt in range(1, max_retries + 1):
         try:
             print(f"    API call attempt {attempt}/{max_retries}...")
-            response = requests.post(
-                API_URL,
-                headers=headers,
-                params={"key": API_KEY},
-                json=payload,
-                timeout=120
-            )
+            response = requests.post(API_URL, headers=headers, json=payload, timeout=120)
             response.raise_for_status()
             return response.json()
 
@@ -151,13 +152,15 @@ def call_gemini_api(
 
 
 def extract_text_from_response(response: dict) -> str | None:
-    """Extract generated text from Gemini API response."""
+    """Extract generated text from Gemini's native generateContent response."""
     try:
         candidates = response.get("candidates", [])
         if candidates:
             parts = candidates[0].get("content", {}).get("parts", [])
             if parts:
-                return parts[0].get("text", "")
+                return "".join(
+                    part.get("text", "") for part in parts if isinstance(part, dict)
+                )
     except Exception as e:
         print(f"    Response parsing error: {e}")
     return None

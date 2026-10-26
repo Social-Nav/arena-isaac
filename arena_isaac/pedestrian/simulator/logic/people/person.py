@@ -164,6 +164,11 @@ class Person:
         return self._character_graph
 
     @property
+    def animation_ready(self) -> bool:
+        """Whether a real simulation tick has initialized this character graph."""
+        return self._character_graph is not None
+
+    @property
     def state(self):
         """The state of the person.
 

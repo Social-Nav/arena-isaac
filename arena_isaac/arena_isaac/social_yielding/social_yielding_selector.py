@@ -45,8 +45,8 @@ import requests
 # ========================================
 
 # GPT-5.4 vision via the DMXAPI gateway, Responses API (/v1/responses).
-MODEL = "gpt-5.4"
-API_URL = "https://jkwl.dmxapi.cn/v1/responses"
+MODEL = "gpt-5.6-terra"
+API_URL = "https://llmapi.roboscience.xyz/v1/responses"
 # Read the DMXAPI key from the environment; never hard-code it in source.
 #   export API_KEY=sk-...
 API_KEY = os.environ.get("API_KEY", "")
@@ -104,9 +104,12 @@ Reasoning steps (do them IN ORDER):
        robot's feet is unbroken ground. If a wall / object / skirting interrupts
        that vertical strip, the point is on a wall base, not reachable floor —
        reject it and pick a point lower in the image where the strip is clean.
-     - It should genuinely open space to yield into (not right at the robot's
-       feet), but stay well within the drivable region (not at the far edge where
-       floor meets wall and depth is unreliable).
+     - The yielding point must be meaningfully FAR from the robot, preferably
+       near the far half of the visible drivable-floor region.
+     - Prefer a point whose metric distance from the robot is approximately
+       1.0 to 5.0 metres, provided it remains clear drivable floor and does
+       not approach walls, furniture, pedestrians, or the depth-unreliable
+       floor-wall boundary.
 
 Coordinate convention:
   - u = horizontal pixel, 0 = left edge, increasing right.
