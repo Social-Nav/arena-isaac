@@ -7,6 +7,8 @@ This is Stage 2 of the data pipeline:
 
 Reads RGB preview videos (mp4), calls Gemini VLM to generate navigation instructions,
 deduplicates them into tasks, and writes meta/tasks.jsonl and meta/episodes.jsonl.
+For fixed social-interaction datasets, an instruction can instead be selected directly
+by name from a YAML config without reading video content or calling the VLM.
 
 Usage:
     python batch_instructions.py \\
@@ -26,6 +28,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
+import yaml
 
 # Camera mount and chunk size come from the conversion script so the two can never
 # disagree about directory names. Edit CAMERA_HEIGHT_CM / CAMERA_PITCH_DEG there.
@@ -43,6 +46,15 @@ MODEL = "gemini-3.1-pro-preview"
 DMX_BASE_URL = os.environ.get("DMX_BASE_URL", "https://llmapi.roboscience.xyz").rstrip("/")
 API_URL = f"{DMX_BASE_URL}/v1beta/models/{MODEL}:generateContent"
 API_KEY = os.environ.get("DMX_API_KEY", "") or os.environ.get("API_KEY", "")
+
+SOCIAL_INTERACTION_TYPES = (
+    "following_human",
+    "frontal_approach",
+    "perpendicular_traffic",
+    "robot_overtaking",
+    "entering_room",
+)
+DEFAULT_INSTRUCTION_CONFIG = Path(__file__).with_name("social_interaction_instructions.yaml")
 
 VLN_PROMPT = """
 You are an expert VLN dataset annotator familiar with the R2R (Room-to-Room) dataset format.
@@ -311,6 +323,44 @@ PLACEHOLDER_PREFIX = "Navigate from start to destination"
 FAILED_PREFIX = "FAILED_GENERATION_EP"
 
 
+def load_social_interaction_instructions(config_path):
+    """Load and validate the five named social-interaction instructions."""
+    path = Path(config_path).expanduser()
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except OSError as e:
+        raise ValueError(f"Cannot read instruction config {path}: {e}") from e
+    except yaml.YAMLError as e:
+        raise ValueError(f"Invalid YAML in instruction config {path}: {e}") from e
+
+    instructions = data.get("instructions")
+    if not isinstance(instructions, dict):
+        raise ValueError(f"{path} must contain an 'instructions' mapping")
+
+    missing = [name for name in SOCIAL_INTERACTION_TYPES if name not in instructions]
+    unknown = sorted(set(instructions) - set(SOCIAL_INTERACTION_TYPES))
+    if missing or unknown:
+        details = []
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if unknown:
+            details.append(f"unknown: {', '.join(unknown)}")
+        raise ValueError(f"Invalid interaction types in {path} ({'; '.join(details)})")
+
+    for name, instruction in instructions.items():
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError(f"Instruction '{name}' in {path} must be a non-empty string")
+        instructions[name] = instruction.strip()
+    return instructions
+
+
+def build_fixed_instructions(episodes, interaction_type, instruction_config):
+    """Assign one named social-interaction instruction to every discovered episode."""
+    instruction = instruction_config[interaction_type]
+    return {ep_id: instruction for ep_id in episodes}
+
+
 def load_existing_instructions(scene_path):
     """{episode_index: instruction} already in meta/episodes.jsonl.
 
@@ -568,6 +618,17 @@ def main():
         help="Optional: pre-generated instructions JSON (skip VLM). Format: {episode_id: instruction}"
     )
     p.add_argument(
+        "--instruction-type",
+        choices=SOCIAL_INTERACTION_TYPES,
+        help="Assign the named social-interaction instruction to every episode (skip VLM)"
+    )
+    p.add_argument(
+        "--instruction-config",
+        default=str(DEFAULT_INSTRUCTION_CONFIG),
+        help=f"YAML containing named social-interaction instructions "
+             f"(default: {DEFAULT_INSTRUCTION_CONFIG})"
+    )
+    p.add_argument(
         "--redo", action="store_true",
         help="Regenerate instructions that already exist (default: reuse them, so a rerun "
              "only pays for new episodes)"
@@ -578,6 +639,19 @@ def main():
         help="Call Gemini VLM to generate instructions (requires API_KEY). If not set, uses placeholders."
     )
     cfg = p.parse_args()
+
+    selected_sources = sum((bool(cfg.instructions), cfg.instruction_type is not None, cfg.use_vlm))
+    if selected_sources > 1:
+        p.error("--instructions, --instruction-type, and --use-vlm are mutually exclusive")
+    if cfg.instruction_type is None and cfg.instruction_config != str(DEFAULT_INSTRUCTION_CONFIG):
+        p.error("--instruction-config requires --instruction-type")
+
+    instruction_config = None
+    if cfg.instruction_type is not None:
+        try:
+            instruction_config = load_social_interaction_instructions(cfg.instruction_config)
+        except ValueError as e:
+            p.error(str(e))
 
     # Handle multiple scenes
     if os.path.isdir(os.path.join(cfg.data_path, "videos")):
@@ -614,7 +688,15 @@ def main():
         print(f"Found {len(episodes)} episodes")
 
         # Generate or load instructions
-        if cfg.instructions:
+        if cfg.instruction_type is not None:
+            instructions = build_fixed_instructions(
+                episodes, cfg.instruction_type, instruction_config)
+            reused, failures = 0, []
+            print(
+                f"Using social-interaction instruction '{cfg.instruction_type}': "
+                f"{instruction_config[cfg.instruction_type]}"
+            )
+        elif cfg.instructions:
             # Load pre-generated instructions
             instr_path = cfg.instructions
             if os.path.isdir(instr_path):
@@ -647,7 +729,8 @@ def main():
                 scene, episodes, True, cfg.redo)
         else:
             # Use placeholders
-            print("Using placeholder instructions (pass --use-vlm or --instructions to generate)")
+            print("Using placeholder instructions (pass --use-vlm, --instructions, or "
+                  "--instruction-type to annotate)")
             instructions, reused, failures = batch_generate_instructions(
                 scene, episodes, False, cfg.redo)
 

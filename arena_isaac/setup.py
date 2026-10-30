@@ -14,7 +14,10 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
-    package_data={'pedestrian.config': ['*.yaml']},
+    package_data={
+        'pedestrian.config': ['*.yaml'],
+        'arena_isaac.data_logging.postprocess': ['*.yaml'],
+    },
     zip_safe=True,
     maintainer='shibuina',
     maintainer_email='anhddhe180559@fpt.edu.vn',

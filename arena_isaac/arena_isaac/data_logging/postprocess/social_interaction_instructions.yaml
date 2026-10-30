@@ -1,0 +1,7 @@
+# Replace each placeholder with the final instruction for that interaction type.
+instructions:
+  following_human: "Follow the pedestrian ahead while maintaining a safe distance behind him/her until he/she stops."
+  frontal_approach: "When a pedestrian blocks the passage, turn around and move back to make space. Wait for the pedestrian to pass, then continue toward your goal."
+  perpendicular_traffic: "Cross through the flow of pedestrians moving laterally in front of you safely."
+  robot_overtaking: "Approach the pedestrian from behind, overtake him/her safely and continue ahead of him/her."
+  entering_room: "When a pedestrian blocks the doorway, turn around and move back to make space. Wait for the pedestrian to pass, then enter the room and continue toward your goal."
