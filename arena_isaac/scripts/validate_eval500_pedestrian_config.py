@@ -15,6 +15,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import time
 import urllib.request
 from collections import Counter
 from pathlib import Path
@@ -53,12 +54,17 @@ def _source_commit() -> str:
 def _head(url: str, cache: dict[str, int]) -> int:
     if url in cache:
         return cache[url]
-    try:
-        request = urllib.request.Request(url, method='HEAD')
-        with urllib.request.urlopen(request, timeout=20) as response:
-            code = response.status
-    except Exception:
-        code = 0
+    code = 0
+    for attempt in range(3):
+        try:
+            request = urllib.request.Request(url, method='HEAD')
+            with urllib.request.urlopen(request, timeout=25) as response:
+                code = response.status
+            if code == 200:
+                break
+        except Exception:
+            code = 0
+        time.sleep(0.5 * (attempt + 1))
     cache[url] = code
     return code
 
