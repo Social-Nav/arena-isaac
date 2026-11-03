@@ -18,6 +18,10 @@ LOCK_FILE=${ARENA_ISAAC_LOCK_FILE:-/tmp/arena_jazzy_ws_isaac_gpu_runtime.lock}
 PYTHONPATH_IN_CONTAINER=${ARENA_ISAAC_PYTHONPATH:-${REPO_IN_CONTAINER}/arena_isaac:/isaac-sim/exts/isaacsim.ros2.bridge/jazzy/rclpy}
 LD_LIBRARY_PATH_IN_CONTAINER=${ARENA_ISAAC_LD_LIBRARY_PATH:-/isaac-sim/exts/isaacsim.ros2.bridge/jazzy/lib}
 ROS_DOMAIN_ID_VALUE=${ARENA_ISAAC_ROS_DOMAIN_ID:-107}
+SOURCE_COMMIT_VALUE=${ARENA_ISAAC_SOURCE_COMMIT:-UNKNOWN}
+EXPECTED_SOURCE_ROOT_VALUE=${ARENA_EXPECTED_SOURCE_ROOT:-${REPO_IN_CONTAINER}/arena_isaac}
+PROVENANCE_MANIFEST_VALUE=${ARENA_PROVENANCE_MANIFEST:-}
+CONTAINER_IMAGE_VALUE=${ARENA_CONTAINER_IMAGE:-UNKNOWN}
 
 # Concrete models are the deterministic seed=20261103 selection recorded in the
 # first four-category engineering run; they are frozen here so each fresh
@@ -51,13 +55,18 @@ for category in "${CATEGORIES[@]}"; do
     export PYTHONPATH=$PYTHONPATH_IN_CONTAINER
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH_IN_CONTAINER
     export ROS_DOMAIN_ID=$ROS_DOMAIN_ID_VALUE
+    export ARENA_ISAAC_SOURCE_COMMIT=$SOURCE_COMMIT_VALUE
+    export ARENA_EXPECTED_SOURCE_ROOT=$EXPECTED_SOURCE_ROOT_VALUE
+    export ARENA_PROVENANCE_MANIFEST=$PROVENANCE_MANIFEST_VALUE
+    export ARENA_CONTAINER_IMAGE=$CONTAINER_IMAGE_VALUE
     cd $REPO_IN_CONTAINER
     /isaac-sim/python.sh arena_isaac/scripts/validate_character_video_smoke.py \
       --output-dir $cat_out \
       --category $category \
       --model ${MODEL[$category]} \
       --seed $SEED \
-      --steps $STEPS
+      --steps $STEPS \
+      --ros-domain-id $ROS_DOMAIN_ID_VALUE
   " >> "$LOG" 2>&1
   rc=$?
   echo "END category=$category rc=$rc utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG"

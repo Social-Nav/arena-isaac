@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -27,6 +28,13 @@ from isaacsim import SimulationApp
 
 CATEGORIES = ('pedestrian', 'doctor', 'construction_worker', 'police')
 
+MODULE_ROLES = {
+    'selector': 'pedestrian.simulator.logic.people.character_selector',
+    'catalog': 'pedestrian.simulator.logic.people.character_assets',
+    'person': 'pedestrian.simulator.logic.people.person',
+    'spawn': 'arena_isaac.services.SpawnPedestrians',
+}
+
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -34,13 +42,141 @@ def _sha256_bytes(data: bytes) -> str:
 
 def _source_commit() -> str:
     """Resolve the enclosing arena_isaac repo commit at runtime."""
+    configured = os.environ.get('ARENA_ISAAC_SOURCE_COMMIT')
+    if configured:
+        return configured.strip()
     repo_root = Path(__file__).parents[2]
     try:
         return subprocess.check_output(
             ['git', '-C', str(repo_root), 'rev-parse', 'HEAD'],
             text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:
-        return os.environ.get('ARENA_ISAAC_SOURCE_COMMIT', 'UNKNOWN')
+        return 'UNKNOWN'
+
+
+def _read_mountinfo():
+    mounts = []
+    try:
+        text = Path('/proc/self/mountinfo').read_text()
+    except OSError as exc:
+        return {'status': 'UNKNOWN', 'error': str(exc), 'mounts': []}
+    for line in text.splitlines():
+        fields = line.split(' - ', 1)
+        if len(fields) != 2:
+            continue
+        left = fields[0].split()
+        right = fields[1].split()
+        if len(left) < 5 or len(right) < 2:
+            continue
+        mounts.append({
+            'mount_point': left[4],
+            'source': right[1],
+            'fstype': right[0],
+            'options': left[5] if len(left) > 5 else '',
+        })
+    return {'status': 'OK', 'error': '', 'mounts': mounts}
+
+
+def _container_id():
+    try:
+        text = Path('/proc/self/cgroup').read_text()
+    except OSError:
+        return 'UNKNOWN'
+    for line in text.splitlines():
+        parts = line.split(':')
+        if len(parts) >= 3:
+            value = parts[2].strip()
+            if '/docker/' in value:
+                return value.rsplit('/docker/', 1)[1].strip()
+            if value.count('/') == 1 and len(value.strip('/')) == 64:
+                return value.strip('/')
+    return os.uname().nodename
+
+
+def _provenance():
+    expected_root = Path(os.environ.get(
+        'ARENA_EXPECTED_SOURCE_ROOT', str(Path(__file__).parents[2]))).resolve()
+    manifest_path = os.environ.get('ARENA_PROVENANCE_MANIFEST', '')
+    manifest = None
+    if manifest_path:
+        manifest = json.loads(Path(manifest_path).read_text())
+    ledger = []
+    failures = []
+    for role, module_name in MODULE_ROLES.items():
+        try:
+            spec = importlib.util.find_spec(module_name)
+            origin = spec.origin if spec is not None else None
+        except Exception as exc:
+            failures.append(f'{role}:FIND_SPEC_ERROR:{type(exc).__name__}:{exc}')
+            ledger.append({'role': role, 'module': module_name,
+                           'origin': None, 'error': f'{type(exc).__name__}:{exc}'})
+            continue
+        if origin is None:
+            failures.append(f'{role}:NO_ORIGIN')
+            ledger.append({'role': role, 'module': module_name, 'origin': None})
+            continue
+        origin_path = Path(origin).resolve()
+        sha = _sha256_bytes(origin_path.read_bytes())
+        under = origin_path == expected_root or expected_root in origin_path.parents
+        expected_sha = None
+        if manifest:
+            expected_sha = (manifest.get('modules', {}).get(role) or {}).get('sha256')
+        ok = under and (expected_sha is None or sha == expected_sha)
+        if not under:
+            failures.append(f'{role}:OUTSIDE_EXPECTED_ROOT:{origin_path}')
+        if expected_sha is not None and sha != expected_sha:
+            failures.append(f'{role}:SHA_MISMATCH:{sha}!={expected_sha}')
+        ledger.append({
+            'role': role, 'module': module_name, 'origin': str(origin_path),
+            'sha256': sha, 'expected_sha256': expected_sha,
+            'under_expected_root': under,
+        })
+    harness_path = Path(__file__).resolve()
+    harness_sha = _sha256_bytes(harness_path.read_bytes())
+    harness_under = (
+        harness_path == expected_root or expected_root in harness_path.parents)
+    expected_harness = None
+    if manifest:
+        expected_harness = (manifest.get('modules', {}).get('harness') or {}).get('sha256')
+    if not harness_under:
+        failures.append(f'harness:OUTSIDE_EXPECTED_ROOT:{harness_path}')
+    if expected_harness is not None and harness_sha != expected_harness:
+        failures.append(f'harness:SHA_MISMATCH:{harness_sha}!={expected_harness}')
+    ledger.append({
+        'role': 'harness', 'module': 'validate_character_video_smoke',
+        'origin': str(harness_path), 'sha256': harness_sha,
+        'expected_sha256': expected_harness,
+        'under_expected_root': harness_under,
+    })
+    mounts = _read_mountinfo()
+    relevant = [
+        m for m in mounts['mounts']
+        if any(token in m['source'] or token in m['mount_point']
+               for token in ('final_arena_isaac', 'arena_isaac_clean_integration',
+                             'outputs', '/opt/arena_ws/install', '/root/.cache',
+                             '/isaac-sim/kit/cache'))
+    ]
+    payload = {
+        'status': 'PASS' if not failures else 'FAIL',
+        'expected_commit': os.environ.get('ARENA_ISAAC_SOURCE_COMMIT', 'UNKNOWN'),
+        'observed_commit': _source_commit(),
+        'expected_source_root': str(expected_root),
+        'harness_source_root': str(Path(__file__).parents[2].resolve()),
+        'python_executable': sys.executable,
+        'pythonpath': os.environ.get('PYTHONPATH', ''),
+        'container_id': _container_id(),
+        'container_image': os.environ.get(
+            'ARENA_CONTAINER_IMAGE', os.environ.get('ARENA_IMAGE', 'UNKNOWN')),
+        'manifest_path': manifest_path,
+        'modules': ledger,
+        'mounts': {'status': mounts['status'], 'error': mounts['error'],
+                   'relevant': relevant},
+        'failures': failures,
+    }
+    if manifest and failures:
+        raise RuntimeError(
+            'PROVENANCE_FAIL_CLOSED: ' + '; '.join(failures))
+    return payload
 
 
 def _write_json(path: Path, payload) -> None:
@@ -131,6 +267,7 @@ def main() -> int:
             / 'pedestrian' / 'config' / 'character_identities.yaml')
         catalog_sha = _sha256_bytes(catalog_path.read_bytes())
         source_commit = _source_commit()
+        provenance = _provenance()
         omni_server = os.environ.get(
             'OMNI_SERVER',
             'https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1')
@@ -354,6 +491,7 @@ def main() -> int:
             'catalog_sha256': catalog_sha,
             'script_path': str(Path(__file__).resolve()),
             'script_sha256': _sha256_bytes(Path(__file__).read_bytes()),
+            'provenance': provenance,
             'isaac_version': Path('/isaac-sim/VERSION').read_text().strip()
             if Path('/isaac-sim/VERSION').is_file() else '',
             'hostname': os.uname().nodename,
