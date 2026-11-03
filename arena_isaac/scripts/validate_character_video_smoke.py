@@ -102,18 +102,51 @@ def _provenance():
         manifest = json.loads(Path(manifest_path).read_text())
     ledger = []
     failures = []
+    repo_root = expected_root.parent
     for role, module_name in MODULE_ROLES.items():
+        if role == 'spawn':
+            # The smoke constructs Person directly and never imports the spawn
+            # service; importing its parent package would create ROS services.
+            # Verify the exact source path + SHA from the manifest instead.
+            manifest_entry = (manifest or {}).get('modules', {}).get(role) or {}
+            rel = manifest_entry.get('path')
+            if not rel:
+                failures.append('spawn:NO_MANIFEST_PATH')
+                ledger.append({'role': role, 'module': module_name,
+                               'origin': None, 'import_method': 'source_path'})
+                continue
+            origin_path = (repo_root / rel).resolve()
+            sha = _sha256_bytes(origin_path.read_bytes()) if origin_path.is_file() else None
+            under = (origin_path == expected_root
+                     or expected_root in origin_path.parents)
+            expected_sha = manifest_entry.get('sha256')
+            ok = under and sha is not None and (
+                expected_sha is None or sha == expected_sha)
+            if not under:
+                failures.append(f'spawn:OUTSIDE_EXPECTED_ROOT:{origin_path}')
+            if sha is None:
+                failures.append(f'spawn:SOURCE_FILE_MISSING:{origin_path}')
+            if expected_sha is not None and sha != expected_sha:
+                failures.append(f'spawn:SHA_MISMATCH:{sha}!={expected_sha}')
+            ledger.append({
+                'role': role, 'module': module_name, 'origin': str(origin_path),
+                'sha256': sha, 'expected_sha256': expected_sha,
+                'under_expected_root': under, 'import_method': 'source_path',
+            })
+            continue
         try:
             spec = importlib.util.find_spec(module_name)
             origin = spec.origin if spec is not None else None
         except Exception as exc:
             failures.append(f'{role}:FIND_SPEC_ERROR:{type(exc).__name__}:{exc}')
             ledger.append({'role': role, 'module': module_name,
-                           'origin': None, 'error': f'{type(exc).__name__}:{exc}'})
+                           'origin': None, 'error': f'{type(exc).__name__}:{exc}',
+                           'import_method': 'actual_import'})
             continue
         if origin is None:
             failures.append(f'{role}:NO_ORIGIN')
-            ledger.append({'role': role, 'module': module_name, 'origin': None})
+            ledger.append({'role': role, 'module': module_name, 'origin': None,
+                           'import_method': 'actual_import'})
             continue
         origin_path = Path(origin).resolve()
         sha = _sha256_bytes(origin_path.read_bytes())
@@ -129,7 +162,7 @@ def _provenance():
         ledger.append({
             'role': role, 'module': module_name, 'origin': str(origin_path),
             'sha256': sha, 'expected_sha256': expected_sha,
-            'under_expected_root': under,
+            'under_expected_root': under, 'import_method': 'actual_import',
         })
     harness_path = Path(__file__).resolve()
     harness_sha = _sha256_bytes(harness_path.read_bytes())
