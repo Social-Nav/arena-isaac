@@ -59,6 +59,7 @@ for category in "${CATEGORIES[@]}"; do
     export ARENA_EXPECTED_SOURCE_ROOT=$EXPECTED_SOURCE_ROOT_VALUE
     export ARENA_PROVENANCE_MANIFEST=$PROVENANCE_MANIFEST_VALUE
     export ARENA_CONTAINER_IMAGE=$CONTAINER_IMAGE_VALUE
+    export ARENA_CONTAINER_ID=$CONTAINER
     cd $REPO_IN_CONTAINER
     /isaac-sim/python.sh arena_isaac/scripts/validate_character_video_smoke.py \
       --output-dir $cat_out \

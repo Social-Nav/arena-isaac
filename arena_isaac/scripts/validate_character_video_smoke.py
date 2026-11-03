@@ -164,7 +164,7 @@ def _provenance():
         'harness_source_root': str(Path(__file__).parents[2].resolve()),
         'python_executable': sys.executable,
         'pythonpath': os.environ.get('PYTHONPATH', ''),
-        'container_id': _container_id(),
+        'container_id': os.environ.get('ARENA_CONTAINER_ID') or _container_id(),
         'container_image': os.environ.get(
             'ARENA_CONTAINER_IMAGE', os.environ.get('ARENA_IMAGE', 'UNKNOWN')),
         'manifest_path': manifest_path,
