@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -29,6 +30,17 @@ CATEGORIES = ('pedestrian', 'doctor', 'construction_worker', 'police')
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _source_commit() -> str:
+    """Resolve the enclosing arena_isaac repo commit at runtime."""
+    repo_root = Path(__file__).parents[2]
+    try:
+        return subprocess.check_output(
+            ['git', '-C', str(repo_root), 'rev-parse', 'HEAD'],
+            text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return os.environ.get('ARENA_ISAAC_SOURCE_COMMIT', 'UNKNOWN')
 
 
 def _write_json(path: Path, payload) -> None:
@@ -118,7 +130,7 @@ def main() -> int:
             Path(__file__).parents[1]
             / 'pedestrian' / 'config' / 'character_identities.yaml')
         catalog_sha = _sha256_bytes(catalog_path.read_bytes())
-        source_commit = '53234f779e48090671d4cb60d20c684c670a86ab'
+        source_commit = _source_commit()
         omni_server = os.environ.get(
             'OMNI_SERVER',
             'https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1')

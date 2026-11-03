@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import sys
 import urllib.request
 from collections import Counter
@@ -37,6 +38,16 @@ ASSET_ROOT = (
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _source_commit() -> str:
+    repo_root = Path(__file__).parents[2]
+    try:
+        return subprocess.check_output(
+            ['git', '-C', str(repo_root), 'rev-parse', 'HEAD'],
+            text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return 'UNKNOWN'
 
 
 def _head(url: str, cache: dict[str, int]) -> int:
@@ -193,6 +204,7 @@ def main() -> int:
 
     payload = {
         'schema': 'arena.isaac.eval500_pedestrian_selection.v2',
+        'source_commit': _source_commit(),
         'scenarios_root': str(scenarios_root),
         'scenario_count': len(scenario_paths),
         'entry_count': len(rows),
