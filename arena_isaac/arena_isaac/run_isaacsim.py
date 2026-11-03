@@ -16,7 +16,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 # Setting the config for simulation and make an simulation.
-_headless = _env_flag('ARENA_ISAAC_HEADLESS', False)
+_headless = _env_flag('ARENA_ISAAC_HEADLESS', False) or _env_flag('ARENA_HEADLESS', False)
 CONFIG = {
     #"renderer": "Wireframe",
     "renderer": os.environ.get('ARENA_ISAAC_RENDERER', 'RayTracedLighting'),
